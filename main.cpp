@@ -1,3 +1,5 @@
+#include <cstdint>
+#include <cstddef>
 #include <print>
 #include <sys/syscall.h>
 #include <unistd.h>

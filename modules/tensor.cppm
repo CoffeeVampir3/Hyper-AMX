@@ -1,8 +1,9 @@
 module;
+#include <cstdint>
+#include <cstddef>
+#include <cstdlib>
 #include <memory>
 #include <mdspan>
-#include <cstdlib>
-#include <cstdint>
 #include <bit>
 export module tensor;
 

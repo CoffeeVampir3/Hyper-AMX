@@ -1,6 +1,7 @@
 module;
-#include <immintrin.h>
 #include <cstdint>
+#include <cstddef>
+#include <immintrin.h>
 #include <thread>
 #include <vector>
 #include <sched.h>
