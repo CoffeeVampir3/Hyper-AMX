@@ -1,6 +1,5 @@
 module;
 #include <cstdint>
-#include <cstddef>
 #include <immintrin.h>
 #include <thread>
 #include <vector>
@@ -22,14 +21,17 @@ export template<typename TA, typename TB, typename TC>
              std::same_as<typename TC::value_type, int32_t>
 void matmul_amx_int8_blocked(TA A, const TB& B, TC C, int thread_id = 0, int num_threads = 1)
 {
+    // Types already checked by requires clause above
+    // Could add runtime optimization hints here with is_contiguous(), etc.
+
     constexpr size_t TILE_M = 16;
     constexpr size_t TILE_K = 64;
     constexpr size_t TILE_N = 16;
     constexpr size_t M_STEP = 32;
     constexpr size_t N_STEP = 32;
-    size_t M = A.rows;
-    size_t K = A.cols;
-    size_t N = C.cols;
+    size_t M = A.extent(0);
+    size_t K = A.extent(1);
+    size_t N = C.extent(1);
     size_t n_per_thread = (N + num_threads - 1) / num_threads;
     size_t n_start = thread_id * n_per_thread;
     size_t n_end = std::min(N, n_start + n_per_thread);
@@ -61,8 +63,8 @@ void matmul_amx_int8_blocked(TA A, const TB& B, TC C, int thread_id = 0, int num
             for (size_t k = 0; k < K; k += TILE_K) {
                 auto a0_ptr = A.row(m) + k;
                 auto a1_ptr = A.row(m + TILE_M) + k;
-                auto b0_ptr = B.tile_ptr(n, k);
-                auto b1_ptr = B.tile_ptr(n + TILE_N, k);
+                auto b0_ptr = B.data() + B.layout(k, n);
+                auto b1_ptr = B.data() + B.layout(k, n + TILE_N);
                 _tile_loadd(0, a0_ptr, A.stride_bytes());
                 _tile_loadd(1, a1_ptr, A.stride_bytes());
                 _tile_loadd(2, b0_ptr, TILE_N * 4);
@@ -87,14 +89,17 @@ export template<typename TA, typename TB, typename TC>
              std::same_as<typename TC::value_type, int32_t>
 void matmul_amx_int8_blocked_mt(TA A, const TB& B, TC C, int num_threads = 0)
 {
+    // Types already checked by requires clause above
+    // Could add runtime optimization hints here with is_contiguous(), etc.
+
     constexpr size_t TILE_M = 16;
     constexpr size_t TILE_K = 64;
     constexpr size_t TILE_N = 16;
     constexpr size_t M_STEP = 32;
     constexpr size_t N_STEP = 32;
-    size_t M = A.rows;
-    size_t K = A.cols;
-    size_t N = C.cols;
+    size_t M = A.extent(0);
+    size_t K = A.extent(1);
+    size_t N = C.extent(1);
     if (num_threads == 0) {
         num_threads = std::thread::hardware_concurrency();
     }
@@ -139,8 +144,8 @@ void matmul_amx_int8_blocked_mt(TA A, const TB& B, TC C, int num_threads = 0)
                 for (size_t k = 0; k < K; k += TILE_K) {
                     auto a0_ptr = A.row(m) + k;
                     auto a1_ptr = A.row(m + TILE_M) + k;
-                    auto b0_ptr = B.tile_ptr(n, k);
-                    auto b1_ptr = B.tile_ptr(n + TILE_N, k);
+                    auto b0_ptr = B.data() + B.layout(k, n);
+                    auto b1_ptr = B.data() + B.layout(k, n + TILE_N);
                     _tile_loadd(0, a0_ptr, A.stride_bytes());
                     _tile_loadd(1, a1_ptr, A.stride_bytes());
                     _tile_loadd(2, b0_ptr, TILE_N * 4);
