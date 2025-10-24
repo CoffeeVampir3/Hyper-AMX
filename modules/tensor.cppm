@@ -3,11 +3,10 @@ module;
 #include <mdspan>
 #include <cstdlib>
 #include <cstdint>
+#include <bit>
 export module tensor;
 
 export enum class bfloat16 : uint16_t {};
-
-export enum class TensorLayout { RowMajor, ColMajor, VNNI };
 
 export template<typename T>
 concept RawStorage = std::same_as<T, uint8_t> || std::same_as<T, uint16_t> ||
@@ -15,85 +14,29 @@ concept RawStorage = std::same_as<T, uint8_t> || std::same_as<T, uint16_t> ||
                      std::same_as<T, int64_t> || std::same_as<T, float> ||
                      std::same_as<T, bfloat16>;
 
-export template<RawStorage T, TensorLayout L, size_t Rows, size_t Cols>
-struct TensorView {
-    using value_type = T;
-    std::mdspan<T, std::extents<size_t, Rows, Cols>> span;
-    static constexpr TensorLayout layout = L;
+export template<RawStorage T, typename Layout>
+struct TensorView;
+
+export struct RowMajorLayout {
     size_t rows, cols, row_stride;
 
-    constexpr T& operator[](size_t i, size_t j) const { return span[i, j]; }
-    constexpr T& operator()(size_t i, size_t j) const { return span[i, j]; }
-    constexpr auto shape() const { return span.extents(); }
-    constexpr T* data() const { return span.data_handle(); }
-    constexpr T* row(size_t i) const { return span.data_handle() + i * row_stride; }
-    constexpr size_t stride_bytes() const { return row_stride * sizeof(T); }
+    constexpr size_t compute_offset(size_t i, size_t j) const {
+        return i * row_stride + j;
+    }
+    constexpr size_t stride_bytes(size_t elem_size) const { return row_stride * elem_size; }
 };
 
-export template<RawStorage T, TensorLayout L = TensorLayout::RowMajor,
-                size_t Rows = std::dynamic_extent, size_t Cols = std::dynamic_extent>
-struct Tensor {
-    using value_type = T;
-    std::unique_ptr<T[], decltype(&std::free)> owned_data;
-    size_t rows, cols, row_stride;
-    static constexpr TensorLayout layout = L;
+export struct ColMajorLayout {
+    size_t rows, cols, col_stride;
 
-    Tensor(size_t r, size_t c, size_t stride, size_t alignment = 64)
-        : owned_data(static_cast<T*>(std::aligned_alloc(alignment, r * stride * sizeof(T))), &std::free),
-          rows(r), cols(c), row_stride(stride) {}
-
-    constexpr auto view() const {
-        return TensorView<T, L, Rows, Cols>{
-            std::mdspan<T, std::extents<size_t, Rows, Cols>>(owned_data.get(), rows, cols),
-            rows, cols, row_stride
-        };
+    constexpr size_t compute_offset(size_t i, size_t j) const {
+        return j * col_stride + i;
     }
-    constexpr T& operator[](size_t i, size_t j) const {
-        if constexpr (L == TensorLayout::RowMajor || L == TensorLayout::VNNI) {
-            return owned_data[i * row_stride + j];
-        } else {
-            return owned_data[j * row_stride + i];
-        }
-    }
-    constexpr T& operator()(size_t i, size_t j) const { return (*this)[i, j]; }
-    constexpr T* data() const { return owned_data.get(); }
-    constexpr T* row(size_t i) const { return owned_data.get() + i * row_stride; }
-    constexpr size_t stride_bytes() const { return row_stride * sizeof(T); }
-    constexpr auto shape() const {
-        if constexpr (Rows != std::dynamic_extent && Cols != std::dynamic_extent) {
-            return std::extents<size_t, Rows, Cols>{};
-        } else {
-            return std::dextents<size_t, 2>{rows, cols};
-        }
-    }
+    constexpr size_t stride_bytes(size_t elem_size) const { return col_stride * elem_size; }
 };
 
-export template<RawStorage T, TensorLayout L = TensorLayout::RowMajor>
-auto make_tensor(size_t rows, size_t cols, size_t alignment = 64) {
-    return Tensor<T, L>(rows, cols, cols, alignment);
-}
-
-export template<RawStorage T, TensorLayout L = TensorLayout::RowMajor,
-                size_t Rows = std::dynamic_extent, size_t Cols = std::dynamic_extent>
-auto make_tensor_static(size_t alignment = 64) {
-    return Tensor<T, L, Rows, Cols>(Rows, Cols, Cols, alignment);
-}
-
-export template<RawStorage T, TensorLayout L = TensorLayout::RowMajor>
-auto make_tensor_strided(size_t rows, size_t cols, size_t row_stride, size_t alignment = 64) {
-    return Tensor<T, L>(rows, cols, row_stride, alignment);
-}
-
-export template<typename T>
-concept IsRowMajor = requires { T::layout; } && T::layout == TensorLayout::RowMajor;
-
-export template<typename T>
-concept IsColMajor = requires { T::layout; } && T::layout == TensorLayout::ColMajor;
-
-export template<typename T>
-concept IsVNNI = requires { T::layout; } && T::layout == TensorLayout::VNNI;
-
-export template<size_t N_BLOCK, size_t K_BLOCK, size_t TILE_N = 16, size_t TILE_K = 64, size_t VNNI_BLK = 4>
+export template<size_t N_BLOCK = 256, size_t K_BLOCK = 4096,
+                size_t TILE_N = 16, size_t TILE_K = 64, size_t VNNI_BLK = 4>
 struct VNNILayout {
     static constexpr size_t n_block = N_BLOCK;
     static constexpr size_t k_block = K_BLOCK;
@@ -107,7 +50,9 @@ struct VNNILayout {
     static constexpr int VNNI_SHIFT = std::countr_zero(VNNI_BLK);
     static constexpr size_t TILE_N_BYTES = TILE_N << VNNI_SHIFT;
 
-    static constexpr size_t compute_offset(size_t K, size_t N, size_t n_begin, size_t k_begin) {
+    size_t K, N;
+
+    constexpr size_t compute_offset(size_t n_begin, size_t k_begin) const {
         size_t n_block_idx = n_begin >> N_BLOCK_SHIFT;
         size_t n_tile_idx = (n_begin >> TILE_N_SHIFT) & ((N_BLOCK >> TILE_N_SHIFT) - 1);
         size_t n_in_tile = n_begin & (TILE_N - 1);
@@ -123,29 +68,90 @@ struct VNNILayout {
     }
 };
 
-export template<RawStorage T, size_t N_BLOCK = 256, size_t K_BLOCK = 4096>
-struct VNNITensor {
+export template<RawStorage T, typename Layout>
+struct Tensor {
     using value_type = T;
-    using layout_type = VNNILayout<N_BLOCK, K_BLOCK>;
-    static constexpr TensorLayout layout = TensorLayout::VNNI;
+    using layout_type = Layout;
     std::unique_ptr<T[], decltype(&std::free)> owned_data;
-    size_t K, N;
+    Layout layout;
 
-    VNNITensor(size_t k, size_t n, size_t alignment = 64) : K(k), N(n),
-        owned_data(static_cast<T*>(std::aligned_alloc(alignment, k * n * sizeof(T))), &std::free) {}
+    constexpr Tensor(Layout l, size_t alignment = 64)
+        : layout(l), owned_data(nullptr, &std::free) {
+        size_t total_size;
+        if constexpr (requires { layout.rows; layout.cols; layout.row_stride; }) {
+            total_size = layout.rows * layout.row_stride;
+        } else if constexpr (requires { layout.K; layout.N; }) {
+            total_size = layout.K * layout.N;
+        }
+        owned_data.reset(static_cast<T*>(std::aligned_alloc(alignment, total_size * sizeof(T))));
+    }
 
-    VNNITensor(const VNNITensor&) = delete;
-    VNNITensor& operator=(const VNNITensor&) = delete;
-    VNNITensor(VNNITensor&&) = default;
-    VNNITensor& operator=(VNNITensor&&) = default;
+    Tensor(const Tensor&) = delete;
+    Tensor& operator=(const Tensor&) = delete;
+    Tensor(Tensor&&) = default;
+    Tensor& operator=(Tensor&&) = default;
 
     constexpr T* data() const { return owned_data.get(); }
-    constexpr T* get_tile_ptr(size_t n, size_t k) const {
-        return data() + layout_type::compute_offset(K, N, n, k);
+    constexpr T* tile_ptr(size_t i, size_t j) const {
+        return data() + layout.compute_offset(i, j);
+    }
+    constexpr T& operator()(size_t i, size_t j) const { return *tile_ptr(i, j); }
+
+    constexpr auto view() const {
+        if constexpr (requires { layout.rows; layout.cols; }) {
+            return TensorView<T, Layout>{
+                std::mdspan<T, std::dextents<size_t, 2>>(data(), layout.rows, layout.cols),
+                layout,
+                layout.rows,
+                layout.cols,
+                layout.row_stride
+            };
+        } else {
+            return *this;
+        }
     }
 };
 
-export template<IsRowMajor TensorSrc, size_t N_BLOCK = 256, size_t K_BLOCK = 4096>
+export template<RawStorage T, typename Layout>
+struct TensorView {
+    using value_type = T;
+    using layout_type = Layout;
+    std::mdspan<T, std::dextents<size_t, 2>> span;
+    Layout layout;
+    size_t rows, cols, row_stride;
+
+    constexpr T& operator[](size_t i, size_t j) const { return span[i, j]; }
+    constexpr T& operator()(size_t i, size_t j) const { return span[i, j]; }
+    constexpr auto shape() const { return span.extents(); }
+    constexpr T* data() const { return span.data_handle(); }
+    constexpr T* row(size_t i) const { return span.data_handle() + i * row_stride; }
+    constexpr size_t stride_bytes() const { return layout.stride_bytes(sizeof(T)); }
+};
+
+export template<RawStorage T>
+auto make_tensor(size_t rows, size_t cols, size_t alignment = 64) {
+    return Tensor<T, RowMajorLayout>(RowMajorLayout{rows, cols, cols}, alignment);
+}
+
+export template<RawStorage T>
+auto make_tensor_strided(size_t rows, size_t cols, size_t row_stride, size_t alignment = 64) {
+    return Tensor<T, RowMajorLayout>(RowMajorLayout{rows, cols, row_stride}, alignment);
+}
+
+export template<typename T>
+concept IsRowMajor = requires { typename T::layout_type; } &&
+                     std::same_as<typename T::layout_type, RowMajorLayout>;
+
+export template<typename T>
+concept IsColMajor = requires { typename T::layout_type; } &&
+                     std::same_as<typename T::layout_type, ColMajorLayout>;
+
+export template<typename T>
+concept IsVNNI = requires { typename T::layout_type; } &&
+                 requires { T::layout_type::n_block; };
+
+export template<typename TensorSrc, size_t N_BLOCK = 256, size_t K_BLOCK = 4096>
+    requires IsRowMajor<TensorSrc>
 auto convert_to_vnni(const TensorSrc& src) {
     using T = typename TensorSrc::value_type;
     static_assert(std::same_as<T, int8_t>, "VNNI conversion only supports int8_t");
@@ -154,9 +160,10 @@ auto convert_to_vnni(const TensorSrc& src) {
     constexpr size_t TILE_K = 64;
     constexpr size_t VNNI_BLK = 4;
 
-    size_t K = src.rows;
-    size_t N = src.cols;
-    VNNITensor<T, N_BLOCK, K_BLOCK> result(K, N);
+    size_t K = src.layout.rows;
+    size_t N = src.layout.cols;
+
+    Tensor<T, VNNILayout<N_BLOCK, K_BLOCK>> result(VNNILayout<N_BLOCK, K_BLOCK>{K, N});
 
     for (size_t n_block_start = 0; n_block_start < N; n_block_start += N_BLOCK) {
         size_t n_block_size = std::min(N_BLOCK, N - n_block_start);
@@ -168,7 +175,7 @@ auto convert_to_vnni(const TensorSrc& src) {
                     size_t k_tile_size = std::min(TILE_K, k_block_size - k_tile);
                     for (size_t k = 0; k < k_tile_size; k += VNNI_BLK) {
                         size_t global_k = k_block_start + k_tile + k;
-                        T* dst_base = result.get_tile_ptr(n_block_start + n_tile, global_k);
+                        T* dst_base = result.tile_ptr(n_block_start + n_tile, global_k);
                         for (size_t n = 0; n < n_tile_size; ++n) {
                             size_t global_n = n_block_start + n_tile + n;
                             dst_base[n * VNNI_BLK + 0] = src(global_k + 0, global_n);

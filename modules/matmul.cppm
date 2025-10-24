@@ -60,8 +60,8 @@ void matmul_amx_int8_blocked(TA A, const TB& B, TC C, int thread_id = 0, int num
             for (size_t k = 0; k < K; k += TILE_K) {
                 auto a0_ptr = A.row(m) + k;
                 auto a1_ptr = A.row(m + TILE_M) + k;
-                auto b0_ptr = B.get_tile_ptr(n, k);
-                auto b1_ptr = B.get_tile_ptr(n + TILE_N, k);
+                auto b0_ptr = B.tile_ptr(n, k);
+                auto b1_ptr = B.tile_ptr(n + TILE_N, k);
                 _tile_loadd(0, a0_ptr, A.stride_bytes());
                 _tile_loadd(1, a1_ptr, A.stride_bytes());
                 _tile_loadd(2, b0_ptr, TILE_N * 4);
@@ -138,8 +138,8 @@ void matmul_amx_int8_blocked_mt(TA A, const TB& B, TC C, int num_threads = 0)
                 for (size_t k = 0; k < K; k += TILE_K) {
                     auto a0_ptr = A.row(m) + k;
                     auto a1_ptr = A.row(m + TILE_M) + k;
-                    auto b0_ptr = B.get_tile_ptr(n, k);
-                    auto b1_ptr = B.get_tile_ptr(n + TILE_N, k);
+                    auto b0_ptr = B.tile_ptr(n, k);
+                    auto b1_ptr = B.tile_ptr(n + TILE_N, k);
                     _tile_loadd(0, a0_ptr, A.stride_bytes());
                     _tile_loadd(1, a1_ptr, A.stride_bytes());
                     _tile_loadd(2, b0_ptr, TILE_N * 4);

@@ -25,24 +25,24 @@ bool request_amx_permission() {
     return bitmask & (1 << XFEATURE_XTILEDATA);
 }
 
-template<typename T>
-void fill(Tensor<T, TensorLayout::RowMajor>& t, T value) {
-    for (size_t i = 0; i < t.shape().extent(0); ++i)
-        for (size_t j = 0; j < t.shape().extent(1); ++j)
+template<typename T, typename Layout>
+void fill(Tensor<T, Layout>& t, T value) {
+    for (size_t i = 0; i < t.layout.rows; ++i)
+        for (size_t j = 0; j < t.layout.cols; ++j)
             t(i, j) = value;
 }
 
-template<typename T, typename Fn>
-void fill(Tensor<T, TensorLayout::RowMajor>& t, Fn&& fn) {
-    for (size_t i = 0; i < t.shape().extent(0); ++i)
-        for (size_t j = 0; j < t.shape().extent(1); ++j)
+template<typename T, typename Layout, typename Fn>
+void fill(Tensor<T, Layout>& t, Fn&& fn) {
+    for (size_t i = 0; i < t.layout.rows; ++i)
+        for (size_t j = 0; j < t.layout.cols; ++j)
             t(i, j) = fn(i, j);
 }
 
 template<typename Fn>
-bool check_result(const Tensor<int32_t, TensorLayout::RowMajor>& c, Fn&& expected_fn, std::string_view test_name) {
-    for (size_t i = 0; i < c.shape().extent(0); ++i) {
-        for (size_t j = 0; j < c.shape().extent(1); ++j) {
+bool check_result(const Tensor<int32_t, RowMajorLayout>& c, Fn&& expected_fn, std::string_view test_name) {
+    for (size_t i = 0; i < c.layout.rows; ++i) {
+        for (size_t j = 0; j < c.layout.cols; ++j) {
             auto expected = expected_fn(i, j);
             if (c(i, j) != expected) {
                 std::println("  FAIL [{}]: C[{},{}] = {} (expected {})", test_name, i, j, c(i, j), expected);
@@ -104,9 +104,9 @@ void benchmark_matmul() {
     constexpr int NUM_ITERS = 1000;
     constexpr size_t CACHE_FLUSH_SIZE = 2ULL * 1024 * 1024 * 1024;
     std::println("=== Benchmark: {}x{}x{}, {} iterations ===", M, K, N, NUM_ITERS);
-    std::vector<Tensor<int8_t, TensorLayout::RowMajor>> a_buffers, b_buffers;
-    std::vector<VNNITensor<int8_t>> b_vnni_buffers;
-    std::vector<Tensor<int32_t, TensorLayout::RowMajor>> c_buffers;
+    std::vector<Tensor<int8_t, RowMajorLayout>> a_buffers, b_buffers;
+    std::vector<Tensor<int8_t, VNNILayout<>>> b_vnni_buffers;
+    std::vector<Tensor<int32_t, RowMajorLayout>> c_buffers;
     a_buffers.reserve(NUM_ITERS);
     b_buffers.reserve(NUM_ITERS);
     b_vnni_buffers.reserve(NUM_ITERS);
