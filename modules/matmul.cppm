@@ -6,7 +6,6 @@ module;
 #include <sched.h>
 export module matmul;
 import tensor;
-import amx_buffer;
 
 struct TileConfig {
     uint8_t palette_id;
@@ -17,7 +16,7 @@ struct TileConfig {
 };
 
 export template<typename TA, typename TB, typename TC>
-    requires IsRowMajor<TA> && IsRowMajor<TC> &&
+    requires IsRowMajor<TA> && IsVNNI<TB> && IsRowMajor<TC> &&
              std::same_as<typename TA::value_type, int8_t> &&
              std::same_as<typename TC::value_type, int32_t>
 void matmul_amx_int8_blocked(TA A, const TB& B, TC C, int thread_id = 0, int num_threads = 1)
@@ -61,8 +60,8 @@ void matmul_amx_int8_blocked(TA A, const TB& B, TC C, int thread_id = 0, int num
             for (size_t k = 0; k < K; k += TILE_K) {
                 auto a0_ptr = A.row(m) + k;
                 auto a1_ptr = A.row(m + TILE_M) + k;
-                auto b0_ptr = B.get_submat_ptr(n, k);
-                auto b1_ptr = B.get_submat_ptr(n + TILE_N, k);
+                auto b0_ptr = B.get_tile_ptr(n, k);
+                auto b1_ptr = B.get_tile_ptr(n + TILE_N, k);
                 _tile_loadd(0, a0_ptr, A.stride_bytes());
                 _tile_loadd(1, a1_ptr, A.stride_bytes());
                 _tile_loadd(2, b0_ptr, TILE_N * 4);
@@ -82,7 +81,7 @@ void matmul_amx_int8_blocked(TA A, const TB& B, TC C, int thread_id = 0, int num
 }
 
 export template<typename TA, typename TB, typename TC>
-    requires IsRowMajor<TA> && IsRowMajor<TC> &&
+    requires IsRowMajor<TA> && IsVNNI<TB> && IsRowMajor<TC> &&
              std::same_as<typename TA::value_type, int8_t> &&
              std::same_as<typename TC::value_type, int32_t>
 void matmul_amx_int8_blocked_mt(TA A, const TB& B, TC C, int num_threads = 0)
@@ -139,8 +138,8 @@ void matmul_amx_int8_blocked_mt(TA A, const TB& B, TC C, int num_threads = 0)
                 for (size_t k = 0; k < K; k += TILE_K) {
                     auto a0_ptr = A.row(m) + k;
                     auto a1_ptr = A.row(m + TILE_M) + k;
-                    auto b0_ptr = B.get_submat_ptr(n, k);
-                    auto b1_ptr = B.get_submat_ptr(n + TILE_N, k);
+                    auto b0_ptr = B.get_tile_ptr(n, k);
+                    auto b1_ptr = B.get_tile_ptr(n + TILE_N, k);
                     _tile_loadd(0, a0_ptr, A.stride_bytes());
                     _tile_loadd(1, a1_ptr, A.stride_bytes());
                     _tile_loadd(2, b0_ptr, TILE_N * 4);
