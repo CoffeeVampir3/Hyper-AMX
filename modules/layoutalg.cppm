@@ -269,31 +269,47 @@ consteval auto scale_strides() {
 //   - Shape S (interpreted as S:1̄)
 //   - Tuple of Tilers (for by-mode application, handled at operation level)
 
-// Helper: Create all-ones stride matching shape structure
-// Converts Shape S to stride 1̄ with same structure
+// Helper: Build colexicographic stride tuple recursively
+// stride[i] = product of all sizes in modes 0..i-1
+template<typename S, size_t I, auto AccSize>
+consteval auto make_colex_stride_tuple() {
+    if constexpr (I >= rank<S>()) {
+        return Tuple<>{};
+    } else {
+        using Elem = get<I, S>;
+        constexpr auto elem_size = size<Elem>();
+        auto head = Int<AccSize>{};
+        auto tail = make_colex_stride_tuple<S, I + 1, AccSize * elem_size>();
+        return []<typename... Ts>(Tuple<Ts...>) {
+            return Tuple<decltype(head), Ts...>{};
+        }(tail);
+    }
+}
+
+// Helper: Create colexicographic stride for a Shape
+// For multi-mode shapes, stride[i] = product of all sizes in modes 0..i-1
+// Example: (4, 4) → (1, 4), (2, 3, 4) → (1, 2, 6)
 template<IntTupleType S>
-consteval auto make_ones_stride() {
+consteval auto make_colex_stride() {
     if constexpr (IntType<S>) {
         return Int<1>{};
     } else {
-        return []<typename... Ss>(Tuple<Ss...>) {
-            return Tuple<decltype(make_ones_stride<Ss>())...>{};
-        }(S{});
+        return make_colex_stride_tuple<S, 0, 1>();
     }
 }
 
 // Tiler interpretation: τ(T) → Layout
 // If T is already a Layout, return it
-// If T is a Shape (IntTuple), interpret as S:1̄
+// If T is a Shape (IntTuple), interpret as S:1̄ (colexicographic stride)
 export template<typename T>
 consteval auto interpret_tiler(T t) {
     if constexpr (LayoutType<T>) {
         // Already a Layout, return as-is
         return t;
     } else if constexpr (IntTupleType<T>) {
-        // Shape → Layout with all-ones stride
-        using Ones = decltype(make_ones_stride<T>());
-        return Layout<T, Ones>{};
+        // Shape → Layout with colexicographic stride
+        using ColexStride = decltype(make_colex_stride<T>());
+        return Layout<T, ColexStride>{};
     }
 }
 
@@ -509,6 +525,38 @@ consteval auto flatten_two(S, T) {
     }
 }
 
+// Helper: Prepend a kept mode with a flattened mode
+// Used for tiled_divide and tiled_product variants
+// Result: Tuple<Kept, ...Flattened>
+template<typename Kept, typename ToFlatten>
+consteval auto prepend_with_flatten(Kept, ToFlatten) {
+    if constexpr (IntType<ToFlatten>) {
+        // Scalar to flatten: Tuple<Kept, ToFlatten>
+        return Tuple<Kept, ToFlatten>{};
+    } else {
+        // Tuple to flatten: Tuple<Kept, ToFlatten...>
+        return []<typename... Ts>(Tuple<Ts...>) {
+            return Tuple<Kept, Ts...>{};
+        }(ToFlatten{});
+    }
+}
+
+// Helper: Extract mode i as a Layout
+// For by-mode operations (logical_divide, logical_product)
+export template<size_t I, typename S, typename D>
+consteval auto extract_mode(Layout<S, D>) {
+    if constexpr (IntType<S>) {
+        // Rank-1 layout, only mode 0 exists
+        static_assert(I == 0, "Mode index out of range");
+        return Layout<S, D>{};
+    } else {
+        // Multi-mode layout, extract mode I
+        using ModeShape = get<I, S>;
+        using ModeStride = get<I, D>;
+        return Layout<ModeShape, ModeStride>{};
+    }
+}
+
 // ========================================
 // Division (Section: Division)
 // ========================================
@@ -573,6 +621,102 @@ consteval auto flat_divide(TA a, TB b)
     auto layout_a = interpret_tiler(a);
     auto layout_b = interpret_tiler(b);
     return flat_divide(layout_a, layout_b);
+}
+
+// tiled_divide: A ⊘ B → ((T_M, T_N), R_M, R_N, L, ...) - tile unit, flatten rests
+// Keeps tiles grouped, flattens rest modes
+export template<typename SA, typename DA, typename SB, typename DB>
+consteval auto tiled_divide(Layout<SA, DA> a, Layout<SB, DB> b) {
+    auto div = divide(a, b);
+    using DivShape = typename decltype(div)::Shape;
+    using DivStride = typename decltype(div)::Stride;
+
+    // Extract the two modes from rank-2 result
+    using Shape0 = get<0, DivShape>;    // Tiles (keep grouped)
+    using Shape1 = get<1, DivShape>;    // Rests (flatten)
+    using Stride0 = get<0, DivStride>;
+    using Stride1 = get<1, DivStride>;
+
+    // Prepend grouped tiles with flattened rests
+    auto tiled_shape = prepend_with_flatten(Shape0{}, Shape1{});
+    auto tiled_stride = prepend_with_flatten(Stride0{}, Stride1{});
+
+    return Layout<decltype(tiled_shape), decltype(tiled_stride)>{};
+}
+
+// Tiler-aware tiled_divide
+export template<typename TA, typename TB>
+consteval auto tiled_divide(TA a, TB b)
+    requires (LayoutType<TA> || IntTupleType<TA>) && (LayoutType<TB> || IntTupleType<TB>)
+          && (!(LayoutType<TA> && LayoutType<TB>))
+{
+    auto layout_a = interpret_tiler(a);
+    auto layout_b = interpret_tiler(b);
+    return tiled_divide(layout_a, layout_b);
+}
+
+// zipped_divide: A ⊘ B → ((T_M, T_N), (R_M, R_N, L, ...)) - gather tiles, gather rests
+// Base divide already produces rank-2: ((Tiles), (Rests))
+// This variant is essentially the identity for our implementation
+export template<typename SA, typename DA, typename SB, typename DB>
+consteval auto zipped_divide(Layout<SA, DA> a, Layout<SB, DB> b) {
+    // Base divide already produces the zipped structure: rank-2 with (tiles, rests)
+    return divide(a, b);
+}
+
+// Tiler-aware zipped_divide
+export template<typename TA, typename TB>
+consteval auto zipped_divide(TA a, TB b)
+    requires (LayoutType<TA> || IntTupleType<TA>) && (LayoutType<TB> || IntTupleType<TB>)
+          && (!(LayoutType<TA> && LayoutType<TB>))
+{
+    auto layout_a = interpret_tiler(a);
+    auto layout_b = interpret_tiler(b);
+    return zipped_divide(layout_a, layout_b);
+}
+
+// logical_divide: A ⊘ B → ((T_M, R_M), (T_N, R_N), ...) - by-mode division
+// Applies division separately to each mode
+// Rank-1 case: same as base divide
+export template<auto SA, auto DA, auto SB, auto DB>
+consteval auto logical_divide(Layout<Int<SA>, Int<DA>> a, Layout<Int<SB>, Int<DB>> b) {
+    // Rank-1: just use base divide
+    return divide(a, b);
+}
+
+// Rank-2 case: apply divide to each mode
+export template<auto SA0, auto SA1, auto DA0, auto DA1, auto SB0, auto SB1, auto DB0, auto DB1>
+consteval auto logical_divide(
+    Layout<Tuple<Int<SA0>, Int<SA1>>, Tuple<Int<DA0>, Int<DA1>>> a,
+    Layout<Tuple<Int<SB0>, Int<SB1>>, Tuple<Int<DB0>, Int<DB1>>> b)
+{
+    // Extract each mode
+    auto a0 = extract_mode<0>(a);
+    auto a1 = extract_mode<1>(a);
+    auto b0 = extract_mode<0>(b);
+    auto b1 = extract_mode<1>(b);
+
+    // Divide each mode separately
+    auto div0 = divide(a0, b0);
+    auto div1 = divide(a1, b1);
+
+    // Result: ((T0, R0), (T1, R1))
+    using Result = Layout<
+        Tuple<typename decltype(div0)::Shape, typename decltype(div1)::Shape>,
+        Tuple<typename decltype(div0)::Stride, typename decltype(div1)::Stride>
+    >;
+    return Result{};
+}
+
+// Tiler-aware logical_divide
+export template<typename TA, typename TB>
+consteval auto logical_divide(TA a, TB b)
+    requires (LayoutType<TA> || IntTupleType<TA>) && (LayoutType<TB> || IntTupleType<TB>)
+          && (!(LayoutType<TA> && LayoutType<TB>))
+{
+    auto layout_a = interpret_tiler(a);
+    auto layout_b = interpret_tiler(b);
+    return logical_divide(layout_a, layout_b);
 }
 
 // ========================================
@@ -641,4 +785,209 @@ consteval auto flat_product(TA a, TB b)
     auto layout_a = interpret_tiler(a);
     auto layout_b = interpret_tiler(b);
     return flat_product(layout_a, layout_b);
+}
+
+// tiled_product: A ⊗ B → ((M, N, ...), T_M, T_N, ...) - originals grouped, flatten tiles
+// Keeps original modes grouped, flattens tile modes
+export template<typename SA, typename DA, typename SB, typename DB>
+consteval auto tiled_product(Layout<SA, DA> a, Layout<SB, DB> b) {
+    auto prod = product(a, b);
+    using ProdShape = typename decltype(prod)::Shape;
+    using ProdStride = typename decltype(prod)::Stride;
+
+    // Extract the two modes from rank-2 result
+    using Shape0 = get<0, ProdShape>;    // Originals (keep grouped)
+    using Shape1 = get<1, ProdShape>;    // Tiles (flatten)
+    using Stride0 = get<0, ProdStride>;
+    using Stride1 = get<1, ProdStride>;
+
+    // Prepend grouped originals with flattened tiles
+    auto tiled_shape = prepend_with_flatten(Shape0{}, Shape1{});
+    auto tiled_stride = prepend_with_flatten(Stride0{}, Stride1{});
+
+    return Layout<decltype(tiled_shape), decltype(tiled_stride)>{};
+}
+
+// Tiler-aware tiled_product
+export template<typename TA, typename TB>
+consteval auto tiled_product(TA a, TB b)
+    requires (LayoutType<TA> || IntTupleType<TA>) && (LayoutType<TB> || IntTupleType<TB>)
+          && (!(LayoutType<TA> && LayoutType<TB>))
+{
+    auto layout_a = interpret_tiler(a);
+    auto layout_b = interpret_tiler(b);
+    return tiled_product(layout_a, layout_b);
+}
+
+// zipped_product: A ⊗ B → ((M, N, ...), (T_M, T_N, ...)) - group by origin
+// Base product already produces rank-2: ((Originals), (Tiles))
+// This variant is essentially the identity for our implementation
+export template<typename SA, typename DA, typename SB, typename DB>
+consteval auto zipped_product(Layout<SA, DA> a, Layout<SB, DB> b) {
+    // Base product already produces the zipped structure: rank-2 with (originals, tiles)
+    return product(a, b);
+}
+
+// Tiler-aware zipped_product
+export template<typename TA, typename TB>
+consteval auto zipped_product(TA a, TB b)
+    requires (LayoutType<TA> || IntTupleType<TA>) && (LayoutType<TB> || IntTupleType<TB>)
+          && (!(LayoutType<TA> && LayoutType<TB>))
+{
+    auto layout_a = interpret_tiler(a);
+    auto layout_b = interpret_tiler(b);
+    return zipped_product(layout_a, layout_b);
+}
+
+// logical_product: A ⊗ B → ((M, T_M), (N, T_N), ...) - by-mode product
+// Applies product separately to each mode
+// Rank-1 case: same as base product
+export template<auto SA, auto DA, auto SB, auto DB>
+consteval auto logical_product(Layout<Int<SA>, Int<DA>> a, Layout<Int<SB>, Int<DB>> b) {
+    // Rank-1: just use base product
+    return product(a, b);
+}
+
+// Rank-2 case: apply product to each mode
+export template<auto SA0, auto SA1, auto DA0, auto DA1, auto SB0, auto SB1, auto DB0, auto DB1>
+consteval auto logical_product(
+    Layout<Tuple<Int<SA0>, Int<SA1>>, Tuple<Int<DA0>, Int<DA1>>> a,
+    Layout<Tuple<Int<SB0>, Int<SB1>>, Tuple<Int<DB0>, Int<DB1>>> b)
+{
+    // Extract each mode
+    auto a0 = extract_mode<0>(a);
+    auto a1 = extract_mode<1>(a);
+    auto b0 = extract_mode<0>(b);
+    auto b1 = extract_mode<1>(b);
+
+    // Product each mode separately
+    auto prod0 = product(a0, b0);
+    auto prod1 = product(a1, b1);
+
+    // Result: ((M0, T0), (M1, T1))
+    using Result = Layout<
+        Tuple<typename decltype(prod0)::Shape, typename decltype(prod1)::Shape>,
+        Tuple<typename decltype(prod0)::Stride, typename decltype(prod1)::Stride>
+    >;
+    return Result{};
+}
+
+// Tiler-aware logical_product
+export template<typename TA, typename TB>
+consteval auto logical_product(TA a, TB b)
+    requires (LayoutType<TA> || IntTupleType<TA>) && (LayoutType<TB> || IntTupleType<TB>)
+          && (!(LayoutType<TA> && LayoutType<TB>))
+{
+    auto layout_a = interpret_tiler(a);
+    auto layout_b = interpret_tiler(b);
+    return logical_product(layout_a, layout_b);
+}
+
+// blocked_product: A ⊗ B → ((M, T_M), (N, T_N), ...) - tile-first (blocks)
+// Like logical_product with (original, tile) ordering
+// Rank-1 case: same as base product
+export template<auto SA, auto DA, auto SB, auto DB>
+consteval auto blocked_product(Layout<Int<SA>, Int<DA>> a, Layout<Int<SB>, Int<DB>> b) {
+    // Rank-1: just use base product (already has (M, T) structure)
+    return product(a, b);
+}
+
+// Rank-2 case: apply product to each mode with (M, T) ordering
+export template<auto SA0, auto SA1, auto DA0, auto DA1, auto SB0, auto SB1, auto DB0, auto DB1>
+consteval auto blocked_product(
+    Layout<Tuple<Int<SA0>, Int<SA1>>, Tuple<Int<DA0>, Int<DA1>>> a,
+    Layout<Tuple<Int<SB0>, Int<SB1>>, Tuple<Int<DB0>, Int<DB1>>> b)
+{
+    // Extract each mode
+    auto a0 = extract_mode<0>(a);
+    auto a1 = extract_mode<1>(a);
+    auto b0 = extract_mode<0>(b);
+    auto b1 = extract_mode<1>(b);
+
+    // Product each mode separately
+    auto prod0 = product(a0, b0);  // Already (M0, T0)
+    auto prod1 = product(a1, b1);  // Already (M1, T1)
+
+    // Result: ((M0, T0), (M1, T1))
+    using Result = Layout<
+        Tuple<typename decltype(prod0)::Shape, typename decltype(prod1)::Shape>,
+        Tuple<typename decltype(prod0)::Stride, typename decltype(prod1)::Stride>
+    >;
+    return Result{};
+}
+
+// Tiler-aware blocked_product
+export template<typename TA, typename TB>
+consteval auto blocked_product(TA a, TB b)
+    requires (LayoutType<TA> || IntTupleType<TA>) && (LayoutType<TB> || IntTupleType<TB>)
+          && (!(LayoutType<TA> && LayoutType<TB>))
+{
+    auto layout_a = interpret_tiler(a);
+    auto layout_b = interpret_tiler(b);
+    return blocked_product(layout_a, layout_b);
+}
+
+// raked_product: A ⊗ B → ((T_M, M), (T_N, N), ...) - rest-first (interleaved)
+// Like logical_product but with (tile, original) ordering - creates cyclic/interleaved distribution
+// Rank-1 case: swap the rank-2 result from base product
+export template<auto SA, auto DA, auto SB, auto DB>
+consteval auto raked_product(Layout<Int<SA>, Int<DA>> a, Layout<Int<SB>, Int<DB>> b) {
+    // Base product gives (M, T), swap to (T, M)
+    auto prod = product(a, b);
+    using ProdShape = typename decltype(prod)::Shape;
+    using ProdStride = typename decltype(prod)::Stride;
+
+    using Shape0 = get<0, ProdShape>;
+    using Shape1 = get<1, ProdShape>;
+    using Stride0 = get<0, ProdStride>;
+    using Stride1 = get<1, ProdStride>;
+
+    // Swap: (T, M)
+    return Layout<Tuple<Shape1, Shape0>, Tuple<Stride1, Stride0>>{};
+}
+
+// Rank-2 case: apply product to each mode and swap each result to (T, M)
+export template<auto SA0, auto SA1, auto DA0, auto DA1, auto SB0, auto SB1, auto DB0, auto DB1>
+consteval auto raked_product(
+    Layout<Tuple<Int<SA0>, Int<SA1>>, Tuple<Int<DA0>, Int<DA1>>> a,
+    Layout<Tuple<Int<SB0>, Int<SB1>>, Tuple<Int<DB0>, Int<DB1>>> b)
+{
+    // Extract each mode
+    auto a0 = extract_mode<0>(a);
+    auto a1 = extract_mode<1>(a);
+    auto b0 = extract_mode<0>(b);
+    auto b1 = extract_mode<1>(b);
+
+    // Product each mode separately, then swap to (T, M)
+    auto prod0 = product(a0, b0);  // (M0, T0)
+    auto prod1 = product(a1, b1);  // (M1, T1)
+
+    // Swap each: (T0, M0) and (T1, M1)
+    using Prod0Shape = typename decltype(prod0)::Shape;
+    using Prod0Stride = typename decltype(prod0)::Stride;
+    using Prod1Shape = typename decltype(prod1)::Shape;
+    using Prod1Stride = typename decltype(prod1)::Stride;
+
+    using Swapped0Shape = Tuple<get<1, Prod0Shape>, get<0, Prod0Shape>>;
+    using Swapped0Stride = Tuple<get<1, Prod0Stride>, get<0, Prod0Stride>>;
+    using Swapped1Shape = Tuple<get<1, Prod1Shape>, get<0, Prod1Shape>>;
+    using Swapped1Stride = Tuple<get<1, Prod1Stride>, get<0, Prod1Stride>>;
+
+    // Result: ((T0, M0), (T1, M1))
+    using Result = Layout<
+        Tuple<Swapped0Shape, Swapped1Shape>,
+        Tuple<Swapped0Stride, Swapped1Stride>
+    >;
+    return Result{};
+}
+
+// Tiler-aware raked_product
+export template<typename TA, typename TB>
+consteval auto raked_product(TA a, TB b)
+    requires (LayoutType<TA> || IntTupleType<TA>) && (LayoutType<TB> || IntTupleType<TB>)
+          && (!(LayoutType<TA> && LayoutType<TB>))
+{
+    auto layout_a = interpret_tiler(a);
+    auto layout_b = interpret_tiler(b);
+    return raked_product(layout_a, layout_b);
 }
