@@ -318,6 +318,124 @@ int main() {
         std::println("  Product variants: structural properties verified ✓");
     }
 
+    // ========================================
+    // VNNI Layout - Real-World Example
+    // ========================================
+
+    std::println("\n=== VNNI Layout ===");
+    {
+        // VNNI layout parameters (simplified for testing):
+        // N = 32, K = 16
+        // N_BLOCK = 16, K_BLOCK = 8
+        // TILE_N = 4, VNNI_BLK = 4
+        //
+        // Hierarchical structure:
+        // - K dimension: k_vnni_blk (innermost, size 4), k_vnni_groups (size 2), k_blocks (size 2)
+        // - N dimension: n_in_tile (size 4), n_tiles (size 4), n_blocks (size 2)
+        //
+        // Memory layout (stride pattern from VNNI formula):
+        // Shape: (n_blocks, k_blocks, n_tiles, k_vnni_groups, n_in_tile, vnni_blk)
+        //      = (2,       2,        4,       2,             4,         4)
+        //
+        // Strides calculated from VNNI formula:
+        // - n_block stride: K = 16
+        // - k_block stride: N_BLOCK * K_BLOCK = 16 * 8 = 128
+        // - n_tile stride: TILE_N * K_BLOCK = 4 * 8 = 32
+        // - k_vnni stride: TILE_N * VNNI_BLK = 4 * 4 = 16
+        // - n_in_tile stride: VNNI_BLK = 4
+        // - vnni_blk stride: 1 (innermost)
+
+        using VNNILayout = Layout<
+            Tuple<Int<2>, Int<2>, Int<4>, Int<2>, Int<4>, Int<4>>,
+            Tuple<Int<16>, Int<128>, Int<32>, Int<16>, Int<4>, Int<1>>
+        >;
+
+        auto vnni = VNNILayout{};
+
+        // Reference VNNI formula for position (k, n):
+        auto vnni_formula = [](size_t k, size_t n) -> size_t {
+            constexpr size_t N_BLOCK = 16;
+            constexpr size_t K_BLOCK = 8;
+            constexpr size_t TILE_N = 4;
+            constexpr size_t VNNI_BLK = 4;
+            constexpr size_t K = 16;
+
+            size_t n_block_idx = n / N_BLOCK;
+            size_t n_tile_idx = (n % N_BLOCK) / TILE_N;
+            size_t n_in_tile = n % TILE_N;
+            size_t k_block_idx = k / K_BLOCK;
+            size_t k_vnni_idx = (k % K_BLOCK) / VNNI_BLK;
+            size_t k_vnni_blk = k % VNNI_BLK;
+
+            size_t n_block_size = N_BLOCK;
+            size_t k_block_size = K_BLOCK;
+
+            return n_block_idx * K
+                 + k_block_idx * (n_block_size * k_block_size)
+                 + n_tile_idx * (TILE_N * k_block_size)
+                 + k_vnni_idx * (TILE_N * VNNI_BLK)
+                 + n_in_tile * VNNI_BLK
+                 + k_vnni_blk;
+        };
+
+        // Convert 2D coordinate (k, n) to 6D hierarchical coordinate for our layout
+        auto to_6d = [](size_t k, size_t n) -> size_t {
+            // K hierarchy: k = k_block*8 + k_vnni*4 + k_vnni_blk
+            // N hierarchy: n = n_block*16 + n_tile*4 + n_in_tile
+            size_t n_block = n / 16;
+            size_t k_block = k / 8;
+            size_t n_tile = (n % 16) / 4;
+            size_t k_vnni = (k % 8) / 4;
+            size_t n_in_tile = n % 4;
+            size_t k_vnni_blk = k % 4;
+
+            // Colexicographic index for shape (2, 2, 4, 2, 4, 4):
+            // idx = c0 + c1*2 + c2*4 + c3*16 + c4*32 + c5*128
+            // where (c0, c1, c2, c3, c4, c5) = (n_block, k_block, n_tile, k_vnni, n_in_tile, k_vnni_blk)
+            return n_block + k_block*2 + n_tile*4 + k_vnni*16 + n_in_tile*32 + k_vnni_blk*128;
+        };
+
+        // Verify key positions match VNNI formula
+        std::vector<std::pair<size_t, size_t>> test_positions = {
+            {0, 0},   // First element
+            {0, 1},   // Second element in n
+            {1, 0},   // Second element in k
+            {4, 0},   // Start of VNNI group 2
+            {0, 4},   // Start of tile 2 in n
+            {0, 16},  // Start of n_block 2
+            {8, 0},   // Start of k_block 2
+            {7, 7},   // Within first major block
+            {15, 31}, // Last element
+        };
+
+        bool all_match = true;
+        for (auto [k, n] : test_positions) {
+            size_t layout_idx = to_6d(k, n);
+            size_t layout_offset = vnni(layout_idx);
+            size_t formula_offset = vnni_formula(k, n);
+
+            if (layout_offset != formula_offset) {
+                std::println("  FAIL: position ({},{}) -> layout offset {}, formula offset {}",
+                           k, n, layout_offset, formula_offset);
+                all_match = false;
+            }
+        }
+
+        if (!all_match) return 1;
+
+        // Verify the layout has the expected total size
+        static_assert(VNNILayout::size_v() == 2 * 2 * 4 * 2 * 4 * 4);
+        static_assert(VNNILayout::size_v() == 512); // 32 × 16 = 512 elements
+
+        // Verify stride properties
+        static_assert(rank<typename VNNILayout::Shape>() == 6);
+
+        std::println("  VNNI: hierarchical layout matches reference formula ✓");
+        std::println("        6-level blocking (n_block, k_block, n_tile, k_vnni, n_in_tile, vnni_blk)");
+        std::println("        Shape: (2, 2, 4, 2, 4, 4) = 512 elements");
+        std::println("        Verified {} sample positions", test_positions.size());
+    }
+
     std::println("\n=== All rigorous tests passed! ===\n");
     std::println("Summary:");
     std::println("  ✓ Layout mappings verified against expected sequences");
@@ -325,7 +443,8 @@ int main() {
     std::println("  ✓ Complement coverage (A, A*) verified");
     std::println("  ✓ Division/Product postconditions satisfied");
     std::println("  ✓ Coalesce mapping preservation verified");
-    std::println("  ✓ All variant structural properties confirmed\n");
+    std::println("  ✓ All variant structural properties confirmed");
+    std::println("  ✓ VNNI hierarchical layout validated against reference\n");
 
     return 0;
 }
