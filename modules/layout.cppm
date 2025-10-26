@@ -61,13 +61,15 @@ struct vnni_layout {
             index_type n_in_tile = n_begin & (TILE_N - 1);
             index_type k_block_idx = k_begin >> K_BLOCK_SHIFT;
             index_type k_vnni_idx = (k_begin >> VNNI_SHIFT) & ((K_BLOCK >> VNNI_SHIFT) - 1);
+            index_type k_in_vnni = k_begin & (VNNI_BLK - 1);
             index_type n_block_size = std::min(static_cast<index_type>(N_BLOCK), N - (n_block_idx << N_BLOCK_SHIFT));
             index_type k_block_size = std::min(static_cast<index_type>(K_BLOCK), K - (k_block_idx << K_BLOCK_SHIFT));
             return n_block_idx * K
                  + k_block_idx * (n_block_size * k_block_size)
                  + n_tile_idx * (TILE_N * k_block_size)
                  + k_vnni_idx * TILE_N_BYTES
-                 + (n_in_tile << VNNI_SHIFT);
+                 + (n_in_tile << VNNI_SHIFT)
+                 + k_in_vnni;
         }
 
         extents_type ext;
@@ -94,4 +96,9 @@ constexpr size_t stride_bytes(const M& m, size_t elem_size) {
         return m.stride(0) * elem_size;
     }
     return 0;
+}
+
+export template<MdspanLike M>
+constexpr size_t stride_bytes(const M& m) {
+    return stride_bytes(m, sizeof(typename M::element_type));
 }

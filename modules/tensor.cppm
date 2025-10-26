@@ -4,8 +4,12 @@ module;
 #include <cstdlib>
 #include <mdspan>
 #include <memory>
+#include <functional>
+#include <concepts>
+#include <numa.h>
 export module tensor;
 export import layout;
+import quantization;
 
 export enum class bfloat16 : uint16_t {};
 
@@ -13,7 +17,37 @@ export template<typename T>
 concept RawStorage = std::same_as<T, uint8_t> || std::same_as<T, uint16_t> ||
                      std::same_as<T, int8_t> || std::same_as<T, int32_t> ||
                      std::same_as<T, int64_t> || std::same_as<T, float> ||
-                     std::same_as<T, bfloat16>;
+                     std::same_as<T, bfloat16> || std::same_as<T, QuantizationParams>;
+
+export template<typename A>
+concept TensorAllocator = requires(A a, size_t n) {
+    typename A::pointer;
+    { a.allocate(n, size_t{64}) } -> std::same_as<typename A::pointer>;
+    { a.deallocate(std::declval<typename A::pointer>(), n) } -> std::same_as<void>;
+};
+
+export template<typename T>
+struct AlignedAllocator {
+    using pointer = T*;
+    T* allocate(size_t count, size_t alignment = 64) const {
+        return static_cast<T*>(std::aligned_alloc(alignment, count * sizeof(T)));
+    }
+    void deallocate(T* ptr, size_t count) const {
+        std::free(ptr);
+    }
+};
+
+export template<typename T>
+struct NumaNodeAllocator {
+    using pointer = T*;
+    int node;
+    T* allocate(size_t count, size_t alignment = 64) const {
+        return static_cast<T*>(numa_alloc_onnode(count * sizeof(T), node));
+    }
+    void deallocate(T* ptr, size_t count) const {
+        numa_free(ptr, count * sizeof(T));
+    }
+};
 
 export template<RawStorage T, typename Extents, typename Layout>
 struct Tensor {
@@ -24,13 +58,27 @@ struct Tensor {
     using mapping_type = typename Layout::template mapping<Extents>;
     using mdspan_type = std::mdspan<T, Extents, Layout>;
 
-    std::unique_ptr<T[], decltype(&std::free)> owned_data;
-    mapping_type map;
+    struct Deleter {
+        std::function<void(T*, size_t)> del_fn;
+        size_t size;
+        void operator()(T* p) const {
+            if (p && del_fn) del_fn(p, size);
+        }
+    };
 
-    constexpr Tensor(Extents e, size_t alignment = 64)
-        : map(e), owned_data(nullptr, &std::free) {
+    mapping_type map;
+    std::unique_ptr<T[], Deleter> owned_data;
+
+    template<TensorAllocator Alloc>
+    Tensor(Extents e, Alloc allocator, size_t alignment = 64)
+        : map(e) {
         size_t total_size = map.required_span_size();
-        owned_data.reset(static_cast<T*>(std::aligned_alloc(alignment, total_size * sizeof(T))));
+        T* ptr = allocator.allocate(total_size, alignment);
+        Deleter del{
+            [allocator](T* p, size_t sz) mutable { allocator.deallocate(p, sz); },
+            total_size
+        };
+        owned_data = std::unique_ptr<T[], Deleter>(ptr, std::move(del));
     }
 
     Tensor(const Tensor&) = delete;
@@ -57,61 +105,24 @@ struct Tensor {
     constexpr const T& operator[](size_t i, size_t j) const { return data()[map(i, j)]; }
 };
 
+export template<RawStorage T, TensorAllocator Alloc>
+auto make_tensor(size_t rows, size_t cols, Alloc allocator, size_t alignment = 64) {
+    using Extents = std::dextents<size_t, 2>;
+    using Layout = std::layout_right;
+    return Tensor<T, Extents, Layout>(Extents{rows, cols}, allocator, alignment);
+}
+
 export template<RawStorage T>
 auto make_tensor(size_t rows, size_t cols, size_t alignment = 64) {
     using Extents = std::dextents<size_t, 2>;
     using Layout = std::layout_right;
-    return Tensor<T, Extents, Layout>(Extents{rows, cols}, alignment);
+    return Tensor<T, Extents, Layout>(Extents{rows, cols}, AlignedAllocator<T>{}, alignment);
 }
 
-export template<RawStorage T>
-auto make_tensor_strided(size_t rows, size_t cols, size_t row_stride, size_t alignment = 64) {
+export template<RawStorage T, TensorAllocator Alloc>
+auto make_tensor_strided(size_t rows, size_t cols, size_t row_stride, Alloc allocator, size_t alignment = 64) {
     using Extents = std::dextents<size_t, 2>;
     using Layout = std::layout_stride;
     std::array<size_t, 2> strides{row_stride, 1};
-    return Tensor<T, Extents, Layout>(typename Layout::template mapping<Extents>{Extents{rows, cols}, strides}, alignment);
-}
-
-export template<MdspanLike M, size_t N_BLOCK = 256, size_t K_BLOCK = 4096>
-    requires std::same_as<typename M::layout_type, std::layout_right>
-auto convert_to_vnni(const M& src) {
-    using T = typename M::element_type;
-    static_assert(std::same_as<T, int8_t>, "VNNI conversion only supports int8_t");
-
-    constexpr size_t TILE_N = 16;
-    constexpr size_t TILE_K = 64;
-    constexpr size_t VNNI_BLK = 4;
-
-    size_t K = src.extent(0);
-    size_t N = src.extent(1);
-
-    using VNNILayout = vnni_layout<N_BLOCK, K_BLOCK>;
-    using Extents = std::dextents<size_t, 2>;
-    Tensor<T, Extents, VNNILayout> result(Extents{K, N});
-    auto dst = result.view();
-
-    for (size_t n_block_start = 0; n_block_start < N; n_block_start += N_BLOCK) {
-        size_t n_block_size = std::min(N_BLOCK, N - n_block_start);
-        for (size_t k_block_start = 0; k_block_start < K; k_block_start += K_BLOCK) {
-            size_t k_block_size = std::min(K_BLOCK, K - k_block_start);
-            for (size_t n_tile = 0; n_tile < n_block_size; n_tile += TILE_N) {
-                size_t n_tile_size = std::min(TILE_N, n_block_size - n_tile);
-                for (size_t k_tile = 0; k_tile < k_block_size; k_tile += TILE_K) {
-                    size_t k_tile_size = std::min(TILE_K, k_block_size - k_tile);
-                    for (size_t k = 0; k < k_tile_size; k += VNNI_BLK) {
-                        size_t global_k = k_block_start + k_tile + k;
-                        size_t global_n = n_block_start + n_tile;
-                        T* dst_base = result.data() + dst.mapping()(global_k, global_n);
-                        for (size_t n = 0; n < n_tile_size; ++n) {
-                            dst_base[n * VNNI_BLK + 0] = src.data_handle()[src.mapping()(global_k + 0, global_n + n)];
-                            dst_base[n * VNNI_BLK + 1] = src.data_handle()[src.mapping()(global_k + 1, global_n + n)];
-                            dst_base[n * VNNI_BLK + 2] = src.data_handle()[src.mapping()(global_k + 2, global_n + n)];
-                            dst_base[n * VNNI_BLK + 3] = src.data_handle()[src.mapping()(global_k + 3, global_n + n)];
-                        }
-                    }
-                }
-            }
-        }
-    }
-    return result;
+    return Tensor<T, Extents, Layout>(typename Layout::template mapping<Extents>{Extents{rows, cols}, strides}, allocator, alignment);
 }

@@ -32,9 +32,12 @@ _tile_release();  // Must call before exit
 
 ### Setup & Data Movement
 ```cpp
-_tile_loadd(tile_idx, ptr, stride_bytes);
-_tile_stored(tile_idx, ptr, stride_bytes);
-_tile_zero(tile_idx);
+void _tile_loadd(__tile dst, const void *base, int stride);
+void _tile_stored(__tile src, void *base, int stride);
+void _tile_zero(__tile tile);
+
+// Non-temporal load (doesn't add to cache)
+void _tile_stream_loadd(__tile dst, const void *base, int stride);
 ```
 
 ### INT8 Matrix Multiply (signed/unsigned combinations)
