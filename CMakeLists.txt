@@ -15,21 +15,24 @@ endif()
 
 target_compile_options(amx_app PRIVATE -stdlib=libc++ -mamx-tile -mamx-int8 -mamx-bf16 -march=native)
 target_link_options(amx_app PRIVATE -stdlib=libc++ -lc++abi)
+target_link_libraries(amx_app PRIVATE numa)
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     target_compile_options(amx_app PRIVATE -O3)
 endif()
 
-add_executable(test_layout)
-target_sources(test_layout PRIVATE test_layoutalg.cpp)
+# NUMA test executable
+add_executable(numatest)
+target_sources(numatest PRIVATE numatest.cpp)
 
 if(MODULE_FILES)
-    target_sources(test_layout PUBLIC FILE_SET CXX_MODULES FILES ${MODULE_FILES})
+    target_sources(numatest PUBLIC FILE_SET CXX_MODULES FILES ${MODULE_FILES})
 endif()
 
-target_compile_options(test_layout PRIVATE -stdlib=libc++ -mamx-tile -mamx-int8 -mamx-bf16 -march=native)
-target_link_options(test_layout PRIVATE -stdlib=libc++ -lc++abi)
+target_compile_options(numatest PRIVATE -stdlib=libc++ -mamx-tile -mamx-int8 -mamx-bf16 -march=native)
+target_link_options(numatest PRIVATE -stdlib=libc++ -lc++abi)
+target_link_libraries(numatest PRIVATE numa)
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    target_compile_options(test_layout PRIVATE -O3)
+    target_compile_options(numatest PRIVATE -O3)
 endif()

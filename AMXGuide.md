@@ -64,3 +64,15 @@ _tile_dpbf16ps(dst, src1, src2);  // BF16 × BF16 → FP32
 |------|---------------|--------------|-------------|
 | INT8 | 16×64 bytes | K % 4 == 0 | INT32 (16 elements/row) |
 | BF16 | 16×64 bytes | K % 2 == 0 | FP32 (16 elements/row) |
+
+## Critical Dimensions
+
+| Metric | INT8 | BF16 |
+|--------|------|------|
+| Tile size | 16×64 (1024B) | 16×32 (1024B) |
+| Ops/tile | 4096 (4 VNNI) | 512 |
+| Default L2 block | 384×384×384 | 384×384×384 |
+| L2 working set | ~442 KB | ~884 KB |
+| Arithmetic intensity | 2048 FLOP/byte | 2048 FLOP/byte |
+| Memory stride | 64 bytes | 64 bytes |
+| Register blocking | 2×2 (4 tiles) | 2×2 (4 tiles) |
