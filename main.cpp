@@ -13,7 +13,7 @@ int main() {
     std::println("");
     run_quantization_benchmark();
     std::println("");
-    //run_numa_matmul_test();
+    run_numa_matmul_test();
     std::println("");
     return 0;
 }

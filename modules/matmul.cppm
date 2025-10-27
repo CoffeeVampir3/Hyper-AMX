@@ -120,7 +120,7 @@ export void matmul_amx_int8_blocked_quantized(Int8RowMajor auto A, Int8VNNI auto
     using namespace amx;
     constexpr size_t M_STEP = 32;
     constexpr size_t N_STEP = 32;
-    constexpr size_t K_BLOCK = 4096;
+    constexpr size_t K_BLOCK = 8096;
     size_t M = A.extent(0);
     size_t K = A.extent(1);
     size_t N = C.extent(1);

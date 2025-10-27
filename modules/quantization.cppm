@@ -102,7 +102,7 @@ export inline void quantize_tile_avx512(
         quantized_i32 = _mm512_max_epi32(quantized_i32, min_vec);
         quantized_i32 = _mm512_min_epi32(quantized_i32, max_vec);
         __m128i packed8 = _mm512_cvtsepi32_epi8(quantized_i32);
-        _mm_storeu_si128((__m128i*)(out_base + row * out_stride), packed8);
+        _mm_stream_si128((__m128i*)(out_base + row * out_stride), packed8); // Non-temporal store.
     }
 }
 
@@ -125,6 +125,6 @@ export inline void dequantize_tile_avx512(
         __m512 delta_f32 = _mm512_mul_ps(v_f32, inv_scale_vec);
         __m512i delta_i32 = _mm512_cvt_roundps_epi32(delta_f32, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
         __m512i result = _mm512_add_epi32(bias_vec, delta_i32);
-        _mm512_storeu_si512(&temp[row][0], result);
+        _mm512_storeu_si512(&temp[row][0], result); //Temporal store because we probably want the value
     }
 }
