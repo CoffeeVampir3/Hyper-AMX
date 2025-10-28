@@ -15,7 +15,12 @@ if(ALL_MODULES)
     target_sources(amx_app PUBLIC FILE_SET CXX_MODULES FILES ${ALL_MODULES})
 endif()
 
-target_compile_options(amx_app PRIVATE -stdlib=libc++ -mamx-tile -mamx-int8 -mamx-bf16 -march=native)
+target_compile_options(amx_app PRIVATE
+    -stdlib=libc++
+    -mamx-tile
+    -mamx-int8
+    -mamx-bf16
+    -march=native)
 target_link_options(amx_app PRIVATE -stdlib=libc++ -lc++abi)
 target_link_libraries(amx_app PRIVATE numa)
 

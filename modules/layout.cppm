@@ -88,17 +88,22 @@ concept MdspanLike = requires(T t) {
 export template<typename Layout>
 concept IsVNNI = requires { Layout::n_block; Layout::tile_n; Layout::vnni_blk; };
 
+export template<typename Layout>
+concept HasStride = std::same_as<Layout, std::layout_right> ||
+                    std::same_as<Layout, std::layout_stride>;
+
 export template<MdspanLike M>
+    requires HasStride<typename M::layout_type>
 constexpr size_t stride_bytes(const M& m, size_t elem_size) {
     if constexpr (std::same_as<typename M::layout_type, std::layout_right>) {
         return m.extent(1) * elem_size;
-    } else if constexpr (std::same_as<typename M::layout_type, std::layout_stride>) {
+    } else {
         return m.stride(0) * elem_size;
     }
-    return 0;
 }
 
 export template<MdspanLike M>
+    requires HasStride<typename M::layout_type>
 constexpr size_t stride_bytes(const M& m) {
     return stride_bytes(m, sizeof(typename M::element_type));
 }

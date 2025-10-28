@@ -6,18 +6,15 @@ module;
 #include <memory>
 #include <functional>
 #include <concepts>
+#include <type_traits>
 #include <numa.h>
 export module tensor;
 export import layout;
-import quantization;
 
 export enum class bfloat16 : uint16_t {};
 
 export template<typename T>
-concept RawStorage = std::same_as<T, uint8_t> || std::same_as<T, uint16_t> ||
-                     std::same_as<T, int8_t> || std::same_as<T, int32_t> ||
-                     std::same_as<T, int64_t> || std::same_as<T, float> ||
-                     std::same_as<T, bfloat16> || std::same_as<T, QuantizationParams>;
+concept RawStorage = std::is_trivially_copyable_v<T> && std::is_standard_layout_v<T>;
 
 export template<typename A>
 concept TensorAllocator = requires(A a, size_t n) {
@@ -86,8 +83,6 @@ struct Tensor {
     Tensor(Tensor&&) = default;
     Tensor& operator=(Tensor&&) = default;
 
-    constexpr T* data() { return owned_data.get(); }
-    constexpr const T* data() const { return owned_data.get(); }
     constexpr T* data_handle() { return owned_data.get(); }
     constexpr const T* data_handle() const { return owned_data.get(); }
 
@@ -95,14 +90,14 @@ struct Tensor {
 
     constexpr size_t extent(size_t dim) const { return map.extents().extent(dim); }
 
-    constexpr auto view() { return mdspan_type{data(), map}; }
-    constexpr auto view() const { return std::mdspan<const T, Extents, Layout>{data(), map}; }
+    constexpr auto view() { return mdspan_type{data_handle(), map}; }
+    constexpr auto view() const { return std::mdspan<const T, Extents, Layout>{data_handle(), map}; }
 
     constexpr operator mdspan_type() { return view(); }
     constexpr operator std::mdspan<const T, Extents, Layout>() const { return view(); }
 
-    constexpr T& operator[](size_t i, size_t j) { return data()[map(i, j)]; }
-    constexpr const T& operator[](size_t i, size_t j) const { return data()[map(i, j)]; }
+    constexpr T& operator[](size_t i, size_t j) { return data_handle()[map(i, j)]; }
+    constexpr const T& operator[](size_t i, size_t j) const { return data_handle()[map(i, j)]; }
 };
 
 export template<RawStorage T, TensorAllocator Alloc>
@@ -117,12 +112,4 @@ auto make_tensor(size_t rows, size_t cols, size_t alignment = 64) {
     using Extents = std::dextents<size_t, 2>;
     using Layout = std::layout_right;
     return Tensor<T, Extents, Layout>(Extents{rows, cols}, AlignedAllocator<T>{}, alignment);
-}
-
-export template<RawStorage T, TensorAllocator Alloc>
-auto make_tensor_strided(size_t rows, size_t cols, size_t row_stride, Alloc allocator, size_t alignment = 64) {
-    using Extents = std::dextents<size_t, 2>;
-    using Layout = std::layout_stride;
-    std::array<size_t, 2> strides{row_stride, 1};
-    return Tensor<T, Extents, Layout>(typename Layout::template mapping<Extents>{Extents{rows, cols}, strides}, allocator, alignment);
 }

@@ -80,42 +80,18 @@ void benchmark_column_parallel_numa(const DualSocketConfig& config) {
                 fill(B_source, [&](std::size_t, std::size_t) { return b_val++; });
 
                 // A: socket-replicated (row-major)
-                A_replicas[iter].emplace(
-                    Extents2D{M, K},
-                    config,
-                    [&](std::int8_t* dest, std::size_t count, int socket) {
-                        std::memcpy(dest, A_source.data(), count * sizeof(std::int8_t));
-                    }
-                );
+                A_replicas[iter] = make_socket_replicated_from<std::int8_t, Extents2D, RowMajor2D>(A_source.view(), config);
 
                 // B: column-partitioned with VNNI conversion
-                B_parts[iter].emplace(
-                    Extents2D{K, N},
-                    NUM_PARTITIONS,
-                    config,
-                    [&](std::int8_t* dest, std::size_t count, int socket) {
-                        std::size_t cols_per_socket = N / NUM_PARTITIONS;
-                        auto src_slice = slice<1>(B_source.view(), socket * cols_per_socket, cols_per_socket);
-                        auto dest_view = std::mdspan<std::int8_t, Extents2D, VNNILayout>(
-                            dest,
-                            Extents2D{K, cols_per_socket}
-                        );
-                        convert_to_vnni(src_slice, dest_view);
-                    }
+                B_parts[iter] = make_column_partitioned_from<std::int8_t, Extents2D, RowMajor2D, VNNILayout, LayoutConversion::ToVNNI>(
+                    B_source.view(), NUM_PARTITIONS, config
                 );
 
                 // C: column-partitioned output (zero-init, int8)
                 C_parts[iter].emplace(Extents2D{M, N}, NUM_PARTITIONS, config);
 
                 // Params: column-partitioned, zero-initialized (computed during matmul)
-                params_parts[iter].emplace(
-                    Extents2D{M / TILE_M, N / TILE_N},
-                    NUM_PARTITIONS,
-                    config,
-                    [](QuantizationParams* dest, std::size_t count, int socket) {
-                        std::fill(dest, dest + count, QuantizationParams{0, 0.0f16});
-                    }
-                );
+                params_parts[iter].emplace(Extents2D{M / TILE_M, N / TILE_N}, NUM_PARTITIONS, config);
 
                 int current = progress_counter.fetch_add(1) + 1;
                 if (current % 50 == 0) {

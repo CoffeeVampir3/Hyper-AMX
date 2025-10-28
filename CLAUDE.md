@@ -1,6 +1,6 @@
-Modules are in ./modules
-Tests are in ./tests
-Documentation is in ./Documentation
+Modules (.cppm) are in ./modules
+Tests (.cppm) are in ./tests
+Documentation (.md) is in ./Documentation
 
 CMakeLists doesn't need to be updated for tests and modules, it automatically adds tests and modules.
 Don't attempt to build the project. The build is done on a remote server you cannot access.

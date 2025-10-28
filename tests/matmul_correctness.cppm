@@ -16,6 +16,19 @@ using namespace amx;
 constexpr auto ARCH_REQ_XCOMP_PERM = 0x1023;
 constexpr auto XFEATURE_XTILEDATA = 18;
 
+using VNNILayout = vnni_layout<256, 4096>;
+inline auto vnni_column_partition(auto view, size_t parts, const auto& config) {
+    return make_column_partitioned_from<int8_t, Extents2D, RowMajor2D, VNNILayout, LayoutConversion::ToVNNI>(
+        view, parts, config
+    );
+}
+
+inline auto vnni_row_partition(auto view, size_t parts, const auto& config) {
+    return make_row_partitioned_from<int8_t, Extents2D, RowMajor2D, VNNILayout, LayoutConversion::ToVNNI>(
+        view, parts, config
+    );
+}
+
 bool request_amx() {
     return syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA) == 0;
 }
@@ -37,8 +50,6 @@ void test_core_amx() {
     if (!request_amx()) std::exit(1);
 
     constexpr size_t M = 32, K = 64, N = 32;
-    using VNNILayout = vnni_layout<256, 4096>;
-
     auto A = make_tensor<int8_t>(M, K);
     auto B_row = make_tensor<int8_t>(K, N);
     int8_t val = 1;
@@ -66,8 +77,6 @@ void test_vnni_layout() {
     if (!request_amx()) std::exit(1);
 
     constexpr size_t M = 32, K = 64, N = 32;
-    using VNNILayout = vnni_layout<256, 4096>;
-
     auto A = make_tensor<int8_t>(M, K);
     auto B_row = make_tensor<int8_t>(K, N);
     int8_t val = 1;
@@ -97,8 +106,6 @@ void test_partitioning() {
     if (!request_amx()) std::exit(1);
 
     constexpr size_t M = 32, K = 64, N = 64, PARTS = 2;
-    using VNNILayout = vnni_layout<256, 4096>;
-
     auto A = make_tensor<int8_t>(M, K);
     auto B_row = make_tensor<int8_t>(K, N);
     int8_t val = 1;
@@ -137,7 +144,6 @@ void test_numa_types() {
     if (!request_amx()) std::exit(1);
 
     constexpr size_t M = 32, K = 64, N = 64;
-    using VNNILayout = vnni_layout<256, 4096>;
     auto config = DualSocketConfig::discover();
 
     auto A_src = make_tensor<int8_t>(M, K);
@@ -151,15 +157,9 @@ void test_numa_types() {
     zero(C_ref);
     reference_matmul(A_src.view(), B_src.view(), C_ref.view());
 
-    SocketReplicated<int8_t, Extents2D, RowMajor2D> A_repl(Extents2D{M, K}, config,
-        [&](int8_t* dest, size_t count, int) { std::memcpy(dest, A_src.data(), count * sizeof(int8_t)); });
+    auto A_repl = make_socket_replicated_from<int8_t, Extents2D, RowMajor2D>(A_src.view(), config);
 
-    ColumnPartitioned<int8_t, Extents2D, VNNILayout> B_part(Extents2D{K, N}, 2, config,
-        [&](int8_t* dest, size_t, int socket) {
-            auto slice_view = slice<1>(B_src.view(), socket * (N/2), N/2);
-            auto dest_view = std::mdspan<int8_t, Extents2D, VNNILayout>(dest, Extents2D{K, N/2});
-            convert_to_vnni(slice_view, dest_view);
-        });
+    auto B_part = vnni_column_partition(B_src.view(), 2, config);
 
     ColumnPartitioned<int32_t, Extents2D, RowMajor2D> C_part(Extents2D{M, N}, 2, config);
 
@@ -176,7 +176,6 @@ void test_numa_multithreaded() {
     if (!request_amx()) std::exit(1);
 
     constexpr size_t M = 64, K = 128, N = 64;
-    using VNNILayout = vnni_layout<256, 4096>;
     auto config = DualSocketConfig::discover();
 
     auto A_src = make_tensor<int8_t>(M, K);
@@ -190,15 +189,9 @@ void test_numa_multithreaded() {
     zero(C_ref);
     reference_matmul(A_src.view(), B_src.view(), C_ref.view());
 
-    SocketReplicated<int8_t, Extents2D, RowMajor2D> A_repl(Extents2D{M, K}, config,
-        [&](int8_t* dest, size_t count, int) { std::memcpy(dest, A_src.data(), count * sizeof(int8_t)); });
+    auto A_repl = make_socket_replicated_from<int8_t, Extents2D, RowMajor2D>(A_src.view(), config);
 
-    ColumnPartitioned<int8_t, Extents2D, VNNILayout> B_part(Extents2D{K, N}, 2, config,
-        [&](int8_t* dest, size_t, int socket) {
-            auto slice_view = slice<1>(B_src.view(), socket * (N/2), N/2);
-            auto dest_view = std::mdspan<int8_t, Extents2D, VNNILayout>(dest, Extents2D{K, N/2});
-            convert_to_vnni(slice_view, dest_view);
-        });
+    auto B_part = vnni_column_partition(B_src.view(), 2, config);
 
     ColumnPartitioned<int32_t, Extents2D, RowMajor2D> C_part(Extents2D{M, N}, 2, config);
 
@@ -214,7 +207,6 @@ void test_quantized_matmul() {
     if (!request_amx()) std::exit(1);
 
     constexpr size_t M = 64, K = 128, N = 64;
-    using VNNILayout = vnni_layout<256, 4096>;
     auto config = DualSocketConfig::discover();
 
     auto A_src = make_tensor<int8_t>(M, K);
@@ -228,15 +220,9 @@ void test_quantized_matmul() {
     zero(C_ref);
     reference_matmul(A_src.view(), B_src.view(), C_ref.view());
 
-    SocketReplicated<int8_t, Extents2D, RowMajor2D> A_repl(Extents2D{M, K}, config,
-        [&](int8_t* dest, size_t count, int) { std::memcpy(dest, A_src.data(), count * sizeof(int8_t)); });
+    auto A_repl = make_socket_replicated_from<int8_t, Extents2D, RowMajor2D>(A_src.view(), config);
 
-    ColumnPartitioned<int8_t, Extents2D, VNNILayout> B_part(Extents2D{K, N}, 2, config,
-        [&](int8_t* dest, size_t, int socket) {
-            auto slice_view = slice<1>(B_src.view(), socket * (N/2), N/2);
-            auto dest_view = std::mdspan<int8_t, Extents2D, VNNILayout>(dest, Extents2D{K, N/2});
-            convert_to_vnni(slice_view, dest_view);
-        });
+    auto B_part = vnni_column_partition(B_src.view(), 2, config);
 
     ColumnPartitioned<int8_t, Extents2D, RowMajor2D> C_part(Extents2D{M, N}, 2, config);
 
@@ -264,6 +250,36 @@ void test_quantized_matmul() {
     std::println("   ✓ Quantized matmul within tolerance\n");
 }
 
+void test_row_parallel() {
+    std::println("7. Row-parallel (K-split) matmul");
+    if (!request_amx()) std::exit(1);
+
+    constexpr size_t M = 256, K = 512, N = 256;
+    auto config = DualSocketConfig::discover();
+
+    auto A_src = make_tensor<int8_t>(M, K);
+    auto B_src = make_tensor<int8_t>(K, N);
+    int8_t val = 1;
+    fill(A_src, [&](auto...) { return (val++ % 126) + 1; });
+    val = 1;
+    fill(B_src, [&](auto...) { return (val++ % 126) + 1; });
+
+    auto C_ref = make_tensor<int32_t>(M, N);
+    zero(C_ref);
+    reference_matmul(A_src.view(), B_src.view(), C_ref.view());
+
+    auto A_part = make_column_partitioned_from<int8_t, Extents2D, RowMajor2D>(A_src.view(), 2, config);
+    auto B_part = vnni_row_partition(B_src.view(), 2, config);
+
+    SocketReplicated<int32_t, Extents2D, RowMajor2D> C_partials(Extents2D{M, N}, config);
+
+    matmul_amx_row_parallel(A_part, B_part, C_partials, config);
+    auto C_result = all_reduce_sum(C_partials, 0, config);
+
+    if (!check_approximate_equal(C_result.view(), C_ref.view(), int32_t{0}, "Row-parallel")) std::exit(1);
+    std::println("   ✓ Row-parallel matmul with all-reduce works\n");
+}
+
 export void run_matmul_correctness() {
     std::println("=== Incremental Validation Tests ===\n");
 
@@ -274,6 +290,7 @@ export void run_matmul_correctness() {
         test_numa_types();
         test_numa_multithreaded();
         test_quantized_matmul();
+        test_row_parallel();
 
         std::println("=== All correctness tests passed! ===");
     } catch (const std::exception& e) {

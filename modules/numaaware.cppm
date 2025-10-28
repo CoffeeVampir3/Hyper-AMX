@@ -1,4 +1,5 @@
 module;
+#include <immintrin.h>
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
@@ -83,7 +84,7 @@ struct SocketReplicated {
                 int cpu = DualSocketConfig::physical_core_id(socket, 0);
                 CPU_SET(cpu, &cpuset);
                 pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-                init(replicas[socket].data(), replicas[socket].mapping().required_span_size(), socket);
+                init(replicas[socket].data_handle(), replicas[socket].mapping().required_span_size(), socket);
             }).join();
         }
     }
@@ -105,14 +106,14 @@ struct SocketReplicated {
             int cpu = DualSocketConfig::physical_core_id(other_socket, 0);
             CPU_SET(cpu, &cpuset);
             pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-            init(replicas[other_socket].data(), replicas[other_socket].mapping().required_span_size(), other_socket);
+            init(replicas[other_socket].data_handle(), replicas[other_socket].mapping().required_span_size(), other_socket);
         }).join();
     }
 
     SocketReplicated(Tensor<T, Extents, Layout>&& source, int source_socket, const DualSocketConfig& config)
         : SocketReplicated(std::move(source), source_socket, config,
             [this, source_socket](T* dest, size_t count, int) {
-                std::memcpy(dest, replicas[source_socket].data(), count * sizeof(T));
+                std::memcpy(dest, replicas[source_socket].data_handle(), count * sizeof(T));
             }) {}
 
     SocketReplicated(Extents e, const DualSocketConfig& config)
@@ -156,7 +157,7 @@ struct SocketPartitioned {
                 int cpu = DualSocketConfig::physical_core_id(socket, 0);
                 CPU_SET(cpu, &cpuset);
                 pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-                init(partitions[socket]->data(), partitions[socket]->mapping().required_span_size(), socket);
+                init(partitions[socket]->data_handle(), partitions[socket]->mapping().required_span_size(), socket);
             }).join();
         }
     }
@@ -197,55 +198,99 @@ using ColumnPartitioned = SocketPartitioned<T, Extents, Layout, static_cast<int>
 export template<typename T, typename Extents, typename Layout>
 using RowPartitioned = SocketPartitioned<T, Extents, Layout, static_cast<int>(PartitionDim::Rows)>;
 
-// Column-parallel NUMA matmul: C[:, partitions] = A[M,K] @ B[K, partitions]
-// A: socket-replicated (one copy per socket)
-// B: column-partitioned across sockets (each socket owns different columns)
-// C: column-partitioned across sockets (each socket computes different output columns)
-// Zero cross-socket communication (outputs independent, full K reduction per socket)
-// Uses physical cores only (no hyperthreads) for optimal memory bandwidth
-export template<typename TA, typename ExtentsA, typename LayoutA,
-                typename TB, typename ExtentsB, typename LayoutB,
-                typename TC, typename ExtentsC, typename LayoutC>
-void matmul_amx_column_parallel(
-    SocketReplicated<TA, ExtentsA, LayoutA>& A_repl,
-    ColumnPartitioned<TB, ExtentsB, LayoutB>& B_part,
-    ColumnPartitioned<TC, ExtentsC, LayoutC>& C_part,
-    const DualSocketConfig& config) {
-
-    int num_sockets = B_part.num_partitions;
-
-    // Matmul kernel processes N_STEP=32 columns at a time, so limit threads accordingly
-    size_t N_per_partition = C_part[0].extent(1);
-    constexpr size_t N_STEP = 32;
-    int max_threads_for_work = std::max(1, static_cast<int>(N_per_partition / N_STEP));
-    int threads_per_socket = std::min(config.physical_cores_per_socket, max_threads_for_work);
-
-    int total_threads = num_sockets * threads_per_socket;
-
-    std::vector<std::jthread> threads;
-    threads.reserve(total_threads);
-
-    for (int socket = 0; socket < num_sockets; socket++) {
-        for (int local_tid = 0; local_tid < threads_per_socket; local_tid++) {
-            threads.emplace_back([&, socket, local_tid, threads_per_socket] {
-                cpu_set_t cpuset;
-                CPU_ZERO(&cpuset);
-                // Pin to physical core (skips hyperthreads)
-                int cpu = DualSocketConfig::physical_core_id(socket, local_tid);
-                CPU_SET(cpu, &cpuset);
-                pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-
-                matmul_amx_int8_blocked(
-                    A_repl.view(socket),
-                    B_part.view(socket),
-                    C_part.view(socket),
-                    local_tid,
-                    threads_per_socket
-                );
-            });
-        }
-    }
+export enum class LayoutConversion {
+    None,
+    ToVNNI
 };
+
+export template<typename T, typename Extents, typename Layout>
+auto make_socket_replicated_from(auto src_view, const DualSocketConfig& config) {
+    return SocketReplicated<T, Extents, Layout>(
+        src_view.extents(), config,
+        [&](T* dest, size_t count, int) {
+            std::memcpy(dest, src_view.data_handle(), count * sizeof(T));
+        });
+}
+
+export template<PartitionDim Dim, typename T, typename SourceExtents, typename SourceLayout, typename DestLayout = SourceLayout, LayoutConversion Conversion = LayoutConversion::None>
+auto make_partitioned_from(auto src_view, int n_parts, const DualSocketConfig& config) {
+    constexpr int dim_idx = static_cast<int>(Dim);
+    size_t dim0 = src_view.extent(0);
+    size_t dim1 = src_view.extent(1);
+    size_t part_dim = src_view.extent(dim_idx);
+    size_t part_size = part_dim / n_parts;
+
+    return SocketPartitioned<T, SourceExtents, DestLayout, dim_idx>(
+        SourceExtents{dim0, dim1}, n_parts, config,
+        [&, part_size](T* dest, size_t, int socket) {
+            auto src_slice = slice<dim_idx>(src_view, socket * part_size, part_size);
+            SourceExtents dest_extents = (dim_idx == 0) ? SourceExtents{part_size, dim1} : SourceExtents{dim0, part_size};
+            auto dest_view = std::mdspan<T, SourceExtents, DestLayout>(dest, dest_extents);
+            if constexpr (Conversion == LayoutConversion::ToVNNI) {
+                convert_to_vnni(src_slice, dest_view);
+            } else {
+                for (size_t i = 0; i < dest_view.extent(0); i++) {
+                    for (size_t j = 0; j < dest_view.extent(1); j++) {
+                        dest_view[i, j] = src_slice[i, j];
+                    }
+                }
+            }
+        });
+}
+
+export template<typename T, typename SourceExtents, typename SourceLayout, typename DestLayout = SourceLayout, LayoutConversion Conversion = LayoutConversion::None>
+auto make_column_partitioned_from(auto src_view, int n_parts, const DualSocketConfig& config) {
+    return make_partitioned_from<PartitionDim::Columns, T, SourceExtents, SourceLayout, DestLayout, Conversion>(src_view, n_parts, config);
+}
+
+export template<typename T, typename SourceExtents, typename SourceLayout, typename DestLayout = SourceLayout, LayoutConversion Conversion = LayoutConversion::None>
+auto make_row_partitioned_from(auto src_view, int n_parts, const DualSocketConfig& config) {
+    return make_partitioned_from<PartitionDim::Rows, T, SourceExtents, SourceLayout, DestLayout, Conversion>(src_view, n_parts, config);
+}
+
+// Parallel all-reduce sum: combines partial results from all sockets into final result
+// Each socket produced partial sums for all output elements (row-parallel pattern)
+// Result allocated on target_socket with proper NUMA first-touch
+// Uses multi-threaded reduction with row-wise work distribution
+export template<typename T, typename Extents, typename Layout>
+auto all_reduce_sum(SocketReplicated<T, Extents, Layout>& partials,
+                    int target_socket, const DualSocketConfig& config) {
+    size_t M = partials[0].extent(0);
+    size_t N = partials[0].extent(1);
+
+    int node = DualSocketConfig::primary_node_for_socket(target_socket);
+    auto result = make_tensor<T>(M, N, NumaNodeAllocator<T>{node});
+
+    int num_threads = config.physical_cores_per_socket;
+    std::vector<std::jthread> threads;
+    threads.reserve(num_threads);
+
+    for (int tid = 0; tid < num_threads; tid++) {
+        threads.emplace_back([&, tid, num_threads] {
+            cpu_set_t cpuset;
+            CPU_ZERO(&cpuset);
+            CPU_SET(DualSocketConfig::physical_core_id(target_socket, tid), &cpuset);
+            pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+
+            size_t rows_per_thread = (M + num_threads - 1) / num_threads;
+            size_t m_start = tid * rows_per_thread;
+            size_t m_end = std::min(M, m_start + rows_per_thread);
+
+            for (size_t i = m_start; i < m_end; i++) {
+                for (size_t j = 0; j < N; j++) {
+                    T sum = partials[0][i, j];
+                    for (int socket = 1; socket < DualSocketConfig::NUM_SOCKETS; socket++) {
+                        sum += partials[socket][i, j];
+                    }
+                    result[i, j] = sum;
+                }
+            }
+        });
+    }
+
+    threads.clear();
+    return result;
+}
 
 // Gathers partitions from all sockets into a single contiguous tensor (non-NUMA-pinned)
 export template<typename T, typename Extents, typename Layout>
@@ -262,14 +307,87 @@ auto all_gather(ColumnPartitioned<T, Extents, Layout>& partitioned) {
         auto src = partitioned.view(socket);
 
         for (size_t i = 0; i < M; i++) {
-            for (size_t j = 0; j < N_per_partition; j++) {
-                result[i, col_offset + j] = src[i, j];
-            }
+            T* dest_row = &result[i, col_offset];
+            const T* src_row = &src[i, 0];
+            size_t bytes_per_row = N_per_partition * sizeof(T);
+            std::memcpy(dest_row, src_row, bytes_per_row);
         }
     }
 
     return result;
 }
+
+export enum class ParallelStrategy {
+    ColumnParallel,
+    RowParallel
+};
+
+export enum class IsQuantized {
+    No,
+    Yes
+};
+
+template<ParallelStrategy Strategy, IsQuantized Quantized>
+void matmul_amx_parallel_impl(auto& A_container, auto& B_container, auto& C_container,
+                               auto params_container, const DualSocketConfig& config) {
+    int num_sockets = B_container.num_partitions;
+    size_t N = C_container[0].extent(1);
+    constexpr size_t N_STEP = 32;
+    int max_threads_for_work = std::max(1, static_cast<int>(N / N_STEP));
+    int threads_per_socket = std::min(config.physical_cores_per_socket, max_threads_for_work);
+
+    std::vector<std::jthread> threads;
+    threads.reserve(num_sockets * threads_per_socket);
+
+    for (int socket = 0; socket < num_sockets; socket++) {
+        for (int local_tid = 0; local_tid < threads_per_socket; local_tid++) {
+            threads.emplace_back([&, socket, local_tid, threads_per_socket] {
+                cpu_set_t cpuset;
+                CPU_ZERO(&cpuset);
+                int cpu = DualSocketConfig::physical_core_id(socket, local_tid);
+                CPU_SET(cpu, &cpuset);
+                pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+
+                if constexpr (Quantized == IsQuantized::Yes) {
+                    matmul_amx_int8_blocked_quantized(
+                        A_container.view(socket),
+                        B_container.view(socket),
+                        C_container.view(socket),
+                        params_container->view(socket),
+                        local_tid,
+                        threads_per_socket
+                    );
+                } else {
+                    matmul_amx_int8_blocked(
+                        A_container.view(socket),
+                        B_container.view(socket),
+                        C_container.view(socket),
+                        local_tid,
+                        threads_per_socket
+                    );
+                }
+            });
+        }
+    }
+}
+
+// Column-parallel NUMA matmul: C[:, partitions] = A[M,K] @ B[K, partitions]
+// A: socket-replicated (one copy per socket)
+// B: column-partitioned across sockets (each socket owns different columns)
+// C: column-partitioned across sockets (each socket computes different output columns)
+// Zero cross-socket communication (outputs independent, full K reduction per socket)
+// Uses physical cores only (no hyperthreads) for optimal memory bandwidth
+export template<typename TA, typename ExtentsA, typename LayoutA,
+                typename TB, typename ExtentsB, typename LayoutB,
+                typename TC, typename ExtentsC, typename LayoutC>
+void matmul_amx_column_parallel(
+    SocketReplicated<TA, ExtentsA, LayoutA>& A_repl,
+    ColumnPartitioned<TB, ExtentsB, LayoutB>& B_part,
+    ColumnPartitioned<TC, ExtentsC, LayoutC>& C_part,
+    const DualSocketConfig& config) {
+    matmul_amx_parallel_impl<ParallelStrategy::ColumnParallel, IsQuantized::No>(
+        A_repl, B_part, C_part, nullptr, config);
+};
 
 export template<typename TA, typename ExtentsA, typename LayoutA,
                 typename TB, typename ExtentsB, typename LayoutB,
@@ -281,38 +399,38 @@ void matmul_amx_column_parallel_quantized(
     ColumnPartitioned<TC, ExtentsC, LayoutC>& C_part,
     ColumnPartitioned<TParams, ExtentsP, LayoutP>& params_part,
     const DualSocketConfig& config) {
+    matmul_amx_parallel_impl<ParallelStrategy::ColumnParallel, IsQuantized::Yes>(
+        A_repl, B_part, C_part, &params_part, config);
+};
 
-    int num_sockets = B_part.num_partitions;
+// Row-parallel NUMA matmul: C[M, N] = A[M, partitions] @ B[partitions, N]
+// A: column-partitioned across sockets (each socket owns different columns = partial K)
+// B: row-partitioned across sockets (each socket owns different rows = partial K)
+// C_partials: each socket produces partial sums for all M×N elements
+// Requires all_reduce_sum() to combine partials into final result
+// Each socket performs partial K reduction → outputs are incomplete
+export template<typename TA, typename ExtentsA, typename LayoutA,
+                typename TB, typename ExtentsB, typename LayoutB,
+                typename TC, typename ExtentsC, typename LayoutC>
+void matmul_amx_row_parallel(
+    ColumnPartitioned<TA, ExtentsA, LayoutA>& A_part,
+    RowPartitioned<TB, ExtentsB, LayoutB>& B_part,
+    SocketReplicated<TC, ExtentsC, LayoutC>& C_partials,
+    const DualSocketConfig& config) {
+    matmul_amx_parallel_impl<ParallelStrategy::RowParallel, IsQuantized::No>(
+        A_part, B_part, C_partials, nullptr, config);
+};
 
-    // Matmul kernel processes N_STEP=32 columns at a time, so limit threads accordingly
-    size_t N_per_partition = C_part[0].extent(1);
-    constexpr size_t N_STEP = 32;
-    int max_threads_for_work = std::max(1, static_cast<int>(N_per_partition / N_STEP));
-    int threads_per_socket = std::min(config.physical_cores_per_socket, max_threads_for_work);
-
-    int total_threads = num_sockets * threads_per_socket;
-
-    std::vector<std::jthread> threads;
-    threads.reserve(total_threads);
-
-    for (int socket = 0; socket < num_sockets; socket++) {
-        for (int local_tid = 0; local_tid < threads_per_socket; local_tid++) {
-            threads.emplace_back([&, socket, local_tid, threads_per_socket] {
-                cpu_set_t cpuset;
-                CPU_ZERO(&cpuset);
-                int cpu = DualSocketConfig::physical_core_id(socket, local_tid);
-                CPU_SET(cpu, &cpuset);
-                pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-
-                matmul_amx_int8_blocked_quantized(
-                    A_repl.view(socket),
-                    B_part.view(socket),
-                    C_part.view(socket),
-                    params_part.view(socket),
-                    local_tid,
-                    threads_per_socket
-                );
-            });
-        }
-    }
+export template<typename TA, typename ExtentsA, typename LayoutA,
+                typename TB, typename ExtentsB, typename LayoutB,
+                typename TC, typename ExtentsC, typename LayoutC,
+                typename TParams, typename ExtentsP, typename LayoutP>
+void matmul_amx_row_parallel_quantized(
+    ColumnPartitioned<TA, ExtentsA, LayoutA>& A_part,
+    RowPartitioned<TB, ExtentsB, LayoutB>& B_part,
+    SocketReplicated<TC, ExtentsC, LayoutC>& C_partials,
+    SocketReplicated<TParams, ExtentsP, LayoutP>& params_partials,
+    const DualSocketConfig& config) {
+    matmul_amx_parallel_impl<ParallelStrategy::RowParallel, IsQuantized::Yes>(
+        A_part, B_part, C_partials, &params_partials, config);
 };

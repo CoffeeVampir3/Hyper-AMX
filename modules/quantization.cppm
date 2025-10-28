@@ -1,7 +1,7 @@
 module;
+#include <immintrin.h>
 #include <cstdint>
 #include <cstdlib>
-#include <immintrin.h>
 #include <algorithm>
 export module quantization;
 

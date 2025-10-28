@@ -28,9 +28,15 @@ concept Int32RowMajor = MdspanLike<T> &&
                         std::same_as<typename T::element_type, int32_t> &&
                         !IsVNNI<typename T::layout_type>;
 
+template<typename T>
+concept HasQuantizationParamsStructure = requires(T t) {
+    { t.bias } -> std::convertible_to<int32_t>;
+    { t.scale } -> std::convertible_to<_Float16>;
+};
+
 export template<typename T>
 concept QuantParamsGrid = MdspanLike<T> &&
-                          std::same_as<typename T::element_type, QuantizationParams>;
+                          HasQuantizationParamsStructure<typename T::element_type>;
 
 // Partition dimension for socket-aware tensors
 export enum class PartitionDim : int {
@@ -60,21 +66,6 @@ export void zero(auto& t) {
 export void ones(auto& t) {
     using T = typename std::remove_reference_t<decltype(t)>::element_type;
     fill(t, T{1});
-}
-
-export template<typename Fn>
-bool check_result(const auto& c, Fn&& expected_fn, std::string_view test_name) {
-    for (std::size_t i = 0; i < c.extent(0); ++i) {
-        for (std::size_t j = 0; j < c.extent(1); ++j) {
-            auto expected = expected_fn(i, j);
-            if (c[i, j] != expected) {
-                std::println("  FAIL [{}]: C[{},{}] = {} (expected {})", test_name, i, j, c[i, j], expected);
-                return false;
-            }
-        }
-    }
-    std::println("  PASS [{}]", test_name);
-    return true;
 }
 
 export template<typename T>

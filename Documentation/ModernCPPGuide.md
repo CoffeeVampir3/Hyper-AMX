@@ -1,5 +1,9 @@
 # C++23 Style Guide - Expert Reference
 
+## General
+
+Prefer pre-reserving memory and filling buffers when writes where possible.
+
 ## Output
 ```cpp
 std::println("Hello, {}!", name);              // default stdout
