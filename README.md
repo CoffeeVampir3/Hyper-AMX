@@ -11,4 +11,4 @@ In progress & evolving design of NUMA aware tensor parallel CPU-only AMX inferen
 
 ### AMXQ
 - AMXQ (Grouped asymmetric mean-centered quantization)
-- Fused AMXQ AMX GEMM
+- Fused AMXQ AMX GEMM (Reduces bandwidth pressure by shrinking the accumulator)
