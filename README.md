@@ -1,4 +1,5 @@
-In progress & evolving design of NUMA aware tensor parallel CPU-only AMX inference engine.
+### Actively in Development
+This is currently in progress and is not feature complete. Below are the existing features, but there's still quite a lot of work before inference can be done.
 
 ### Main points:
 - Modern C++ (cpp23)
