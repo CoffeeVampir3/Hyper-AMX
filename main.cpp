@@ -3,17 +3,11 @@ import quantization_test;
 import quantization_benchmark;
 import matmul_correctness;
 import numa_matmul_test;
+import qtensor;
 
 int main() {
     std::println("=== AMX Test Suite ===\n");
 
-    run_matmul_correctness();
-    std::println("");
-    run_quantization_tests();
-    std::println("");
-    run_quantization_benchmark();
-    std::println("");
-    run_numa_matmul_test();
-    std::println("");
+    run_qtensor_tests();
     return 0;
 }

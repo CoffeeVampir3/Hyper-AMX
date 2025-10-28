@@ -74,6 +74,23 @@ struct vnni_layout {
 
         extents_type ext;
     };
+
+    template<typename SrcView, typename DstView>
+    static void copy_from(const SrcView& src, DstView& dst, int dim, size_t offset, size_t size) {
+        if (dim == 0) {
+            for (size_t k = 0; k < size; k++) {
+                for (size_t n = 0; n < src.extent(1); n++) {
+                    dst[k, n] = src[offset + k, n];
+                }
+            }
+        } else {
+            for (size_t k = 0; k < src.extent(0); k++) {
+                for (size_t n = 0; n < size; n++) {
+                    dst[k, n] = src[k, offset + n];
+                }
+            }
+        }
+    }
 };
 
 export template<typename T>
