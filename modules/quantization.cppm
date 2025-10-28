@@ -5,12 +5,24 @@ module;
 #include <algorithm>
 export module quantization;
 
-export struct QuantizationParams {
+/*
+AMXQ: AMX Quantization Library
+Grouped asymmetric INT8
+
+Group size 16×16 elements (one AMX tile)
+Quantize: q = round((x - bias) × scale)
+Dequantize: x = bias + round(q / scale)
+Per-tile mean (asymmetric zero-point)
+Scales of: 127.0 / max_abs_delta (maximum absolute deviation from bias)
+*/
+export namespace AMXQ {
+
+struct QuantizationParams {
     int32_t bias;
     _Float16 scale;
 };
 
-inline __m512 cvt_fp16_to_fp32_scalar(_Float16 val) {
+inline __m512 broadcast_fp16_to_fp32(_Float16 val) {
     uint16_t fp16_bits = *reinterpret_cast<uint16_t*>(&val);
     __m256i fp16_vec = _mm256_set1_epi16(fp16_bits);
     return _mm512_cvtph_ps(fp16_vec);
@@ -25,7 +37,7 @@ inline __m512 fast_reciprocal_ps(__m512 a) {
     return _mm512_mul_ps(x0, correction);
 }
 
-export inline QuantizationParams compute_quantization_params(const int32_t tile[16][16]) {
+inline QuantizationParams compute_quantization_params(const int32_t tile[16][16]) {
     QuantizationParams params;
     __m512i sum_vec = _mm512_setzero_si512();
 
@@ -65,7 +77,7 @@ export inline QuantizationParams compute_quantization_params(const int32_t tile[
     return params;
 }
 
-export inline int8_t quantize_scalar(int32_t value, int32_t bias, _Float16 scale) {
+inline int8_t quantize_scalar(int32_t value, int32_t bias, _Float16 scale) {
     int32_t delta = value - bias;
     float scale_fp32 = (float)scale;
     int32_t quantized = (int32_t)__builtin_roundf(delta * scale_fp32);
@@ -74,14 +86,14 @@ export inline int8_t quantize_scalar(int32_t value, int32_t bias, _Float16 scale
     return (int8_t)quantized;
 }
 
-export inline int32_t dequantize_scalar(int8_t value, int32_t bias, _Float16 scale) {
+inline int32_t dequantize_scalar(int8_t value, int32_t bias, _Float16 scale) {
     float scale_fp32 = (float)scale;
     float inv_scale = 1.0f / scale_fp32;
     int32_t delta = (int32_t)__builtin_roundf(value * inv_scale);
     return bias + delta;
 }
 
-export inline void quantize_tile_avx512(
+inline void quantize_tile_avx512(
     const int32_t temp[16][16],
     int8_t* out_base,
     size_t out_stride,
@@ -89,7 +101,7 @@ export inline void quantize_tile_avx512(
     _Float16 scale)
 {
     __m512i bias_vec = _mm512_set1_epi32(bias);
-    __m512 scale_vec = cvt_fp16_to_fp32_scalar(scale);
+    __m512 scale_vec = broadcast_fp16_to_fp32(scale);
 
     for (int row = 0; row < 16; row++) {
         __m512i v_i32 = _mm512_loadu_si512(&temp[row][0]);
@@ -106,7 +118,7 @@ export inline void quantize_tile_avx512(
     }
 }
 
-export inline void dequantize_tile_avx512(
+inline void dequantize_tile_avx512(
     const int8_t* in_base,
     size_t in_stride,
     int32_t temp[16][16],
@@ -127,4 +139,6 @@ export inline void dequantize_tile_avx512(
         __m512i result = _mm512_add_epi32(bias_vec, delta_i32);
         _mm512_storeu_si512(&temp[row][0], result); //Temporal store because we probably want the value
     }
+}
+
 }

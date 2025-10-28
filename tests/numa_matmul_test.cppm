@@ -59,7 +59,7 @@ void benchmark_column_parallel_numa(const DualSocketConfig& config) {
     std::vector<std::optional<ColumnPartitioned<std::int8_t, Extents2D, RowMajor2D>>> C_parts(NUM_ITERS);
 
     // Per-tile quantization params (M/TILE_M × N/TILE_N tiles)
-    std::vector<std::optional<ColumnPartitioned<QuantizationParams, Extents2D, RowMajor2D>>> params_parts(NUM_ITERS);
+    std::vector<std::optional<ColumnPartitioned<AMXQ::QuantizationParams, Extents2D, RowMajor2D>>> params_parts(NUM_ITERS);
 
     constexpr int ALLOC_THREADS = 50;
     std::vector<std::jthread> alloc_threads;
@@ -131,7 +131,7 @@ void benchmark_column_parallel_numa(const DualSocketConfig& config) {
     auto params_view = params_parts[VALIDATE_ITER]->view(0);
     auto C_view = C_parts[VALIDATE_ITER]->view(0);
 
-    QuantizationParams p00 = params_view[0, 0];
+    AMXQ::QuantizationParams p00 = params_view[0, 0];
     std::println("Tile[0,0] quantization params: bias={}, scale={}", p00.bias, (float)p00.scale);
 
     // Verify scale is non-zero (should be computed, not zero-initialized)
@@ -144,7 +144,7 @@ void benchmark_column_parallel_numa(const DualSocketConfig& config) {
         std::println("  Sample dequantized values from tile[0,0]:");
         for (int i = 0; i < 3; i++) {
             int8_t quantized = C_view[i, 0];
-            int32_t dequantized = dequantize_scalar(quantized, p00.bias, p00.scale);
+            int32_t dequantized = AMXQ::dequantize_scalar(quantized, p00.bias, p00.scale);
             std::println("    C[{},0]: quantized={:4d}, dequantized={:8d}", i, quantized, dequantized);
         }
     }

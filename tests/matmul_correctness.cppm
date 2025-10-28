@@ -226,7 +226,7 @@ void test_quantized_matmul() {
 
     ColumnPartitioned<int8_t, Extents2D, RowMajor2D> C_part(Extents2D{M, N}, 2, config);
 
-    ColumnPartitioned<QuantizationParams, Extents2D, RowMajor2D> params_part(
+    ColumnPartitioned<AMXQ::QuantizationParams, Extents2D, RowMajor2D> params_part(
         Extents2D{M / TILE_M, N / TILE_N}, 2, config
     );
 
@@ -241,7 +241,7 @@ void test_quantized_matmul() {
             size_t tile_i = i / TILE_M;
             size_t tile_j = j / TILE_N;
             auto params = params_gathered[tile_i, tile_j];
-            C_dequantized[i, j] = dequantize_scalar(C_quantized[i, j], params.bias, params.scale);
+            C_dequantized[i, j] = AMXQ::dequantize_scalar(C_quantized[i, j], params.bias, params.scale);
         }
     }
 

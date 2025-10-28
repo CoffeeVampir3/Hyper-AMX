@@ -32,9 +32,9 @@ inline void store_and_quantize_tile(
     size_t m, size_t n, size_t tile_m, size_t tile_n, size_t C_stride)
 {
     _tile_stored(tmm_register, tile_temp, amx::TILE_STRIDE_BYTES);
-    auto params = compute_quantization_params(tile_temp);
+    auto params = AMXQ::compute_quantization_params(tile_temp);
     params_out[tile_m, tile_n] = params;
-    quantize_tile_avx512(tile_temp, C.data_handle() + C.mapping()(m, n),
+    AMXQ::quantize_tile_avx512(tile_temp, C.data_handle() + C.mapping()(m, n),
                         C_stride, params.bias, params.scale);
 }
 
