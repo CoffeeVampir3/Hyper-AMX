@@ -223,7 +223,7 @@ void quantize_from_reference(QTensor& qtensor, const RefView& ref_view) {
 template<typename QTensorA, typename QTensorB, typename Extents>
 auto compute_quantized_matmul(const QTensorA& A_q, const QTensorB& B_q, size_t M, size_t K, size_t N) {
     constexpr size_t TILE_SIZE = 16;
-    auto C = Tensor<int32_t, Extents, std::layout_right>(Extents{M, N});
+    auto C = Tensor<int32_t, Extents, RowMajorLayout>(Extents{M, N});
 
     for (size_t i = 0; i < M; i++) {
         for (size_t n = 0; n < N; n++) {
@@ -256,8 +256,8 @@ export void test_quantized_matmul() {
     constexpr size_t M = 64, K = 64, N = 64;
     using Extents = std::dextents<size_t, 2>;
 
-    auto A_ref = Tensor<int32_t, Extents, std::layout_right>(Extents{M, K});
-    auto B_ref = Tensor<int32_t, Extents, std::layout_right>(Extents{K, N});
+    auto A_ref = Tensor<int32_t, Extents, RowMajorLayout>(Extents{M, K});
+    auto B_ref = Tensor<int32_t, Extents, RowMajorLayout>(Extents{K, N});
 
     auto A_ref_view = A_ref.view();
     auto B_ref_view = B_ref.view();
@@ -274,7 +274,7 @@ export void test_quantized_matmul() {
         }
     }
 
-    auto C_ref = Tensor<int32_t, Extents, std::layout_right>(Extents{M, N});
+    auto C_ref = Tensor<int32_t, Extents, RowMajorLayout>(Extents{M, N});
     auto C_ref_view = C_ref.view();
 
     for (size_t i = 0; i < M; i++) {
@@ -329,8 +329,8 @@ export void test_quantized_vnni_slicing() {
     constexpr size_t M = 64, K = 128, N = 64;
     using Extents = std::dextents<size_t, 2>;
 
-    auto A_ref = Tensor<int32_t, Extents, std::layout_right>(Extents{M, K});
-    auto B_ref = Tensor<int32_t, Extents, std::layout_right>(Extents{K, N});
+    auto A_ref = Tensor<int32_t, Extents, RowMajorLayout>(Extents{M, K});
+    auto B_ref = Tensor<int32_t, Extents, RowMajorLayout>(Extents{K, N});
 
     for (size_t i = 0; i < M; i++) {
         for (size_t j = 0; j < K; j++) {
@@ -363,7 +363,7 @@ export void test_quantized_vnni_slicing() {
 
     auto C_sliced = compute_quantized_matmul<QTensor, QTensorVNNI, Extents>(A_sliced, B_sliced, M, k_slice_size, N);
 
-    auto C_ref_partial = Tensor<int32_t, Extents, std::layout_right>(Extents{M, N});
+    auto C_ref_partial = Tensor<int32_t, Extents, RowMajorLayout>(Extents{M, N});
     for (size_t i = 0; i < M; i++) {
         for (size_t n = 0; n < N; n++) {
             int32_t sum = 0;
