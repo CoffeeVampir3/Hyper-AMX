@@ -57,8 +57,12 @@ struct ColumnMajor {
 
 template<size_t N_BLOCK, size_t K_BLOCK, size_t TILE_N = 16, size_t TILE_K = 64, size_t VNNI_BLK = 4>
 struct VNNI {
+    using is_vnni_layout = std::true_type;
+
     template<typename Extents>
     struct mapping {
+        using is_vnni_layout = std::true_type;
+
         Extents extents_;
 
         static constexpr size_t TILE_N_BYTES = TILE_N * VNNI_BLK;
@@ -115,6 +119,24 @@ struct VNNI {
             }
         }
     }
+};
+
+template<typename View>
+concept Int8RowMajor = requires(View v) {
+    requires std::same_as<typename View::element_type, int8_t>;
+    requires std::same_as<typename View::layout_type, RowMajor>;
+};
+
+template<typename View>
+concept Int8VNNI = requires(View v) {
+    requires std::same_as<typename View::element_type, int8_t>;
+    requires requires { typename View::layout_type::is_vnni_layout; };
+};
+
+template<typename View>
+concept Int32RowMajor = requires(View v) {
+    requires std::same_as<typename View::element_type, int32_t>;
+    requires std::same_as<typename View::layout_type, RowMajor>;
 };
 
 }
