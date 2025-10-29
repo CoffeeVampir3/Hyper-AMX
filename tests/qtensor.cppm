@@ -1,7 +1,6 @@
 module;
 #include <cstddef>
 #include <cstdlib>
-#include <cstring>
 #include <concepts>
 #include <mdspan>
 #include <memory>
@@ -10,186 +9,8 @@ module;
 #include <cmath>
 export module qtensor;
 import quantization;
-
-export template<typename L, typename SrcView, typename DstView>
-concept TensorLayout = requires(SrcView src, DstView dst, int dim, size_t offset, size_t size) {
-    typename L::template mapping<std::dextents<size_t, 2>>;
-    { L::copy_from(src, dst, dim, offset, size) } -> std::same_as<void>;
-};
-
-export struct RowMajorLayout {
-    template<typename Extents>
-    using mapping = typename std::layout_right::template mapping<Extents>;
-
-    template<typename SrcView, typename DstView>
-    static void copy_from(const SrcView& src, DstView& dst, int dim, size_t offset, size_t size) {
-        using T = typename DstView::element_type;
-
-        if (dim == 0) {
-            size_t row_bytes = src.extent(1) * sizeof(T);
-            std::memcpy(dst.data_handle(), src.data_handle() + offset * src.extent(1), size * row_bytes);
-        } else {
-            for (size_t i = 0; i < src.extent(0); i++) {
-                for (size_t j = 0; j < size; j++) {
-                    dst[i, j] = src[i, offset + j];
-                }
-            }
-        }
-    }
-};
-
-export struct ColumnMajorLayout {
-    template<typename Extents>
-    using mapping = typename std::layout_left::template mapping<Extents>;
-
-    template<typename SrcView, typename DstView>
-    static void copy_from(const SrcView& src, DstView& dst, int dim, size_t offset, size_t size) {
-        using T = typename DstView::element_type;
-
-        if (dim == 1) {
-            size_t col_bytes = src.extent(0) * sizeof(T);
-            std::memcpy(dst.data_handle(), src.data_handle() + offset * src.extent(0), size * col_bytes);
-        } else {
-            for (size_t i = 0; i < size; i++) {
-                for (size_t j = 0; j < src.extent(1); j++) {
-                    dst[i, j] = src[offset + i, j];
-                }
-            }
-        }
-    }
-};
-
-export template<size_t BlockM, size_t BlockN>
-struct VNNILayout {
-    template<typename Extents>
-    struct mapping {
-        Extents extents_;
-        constexpr mapping(Extents e) : extents_(e) {}
-        constexpr const Extents& extents() const { return extents_; }
-        constexpr size_t required_span_size() const {
-            return extents_.extent(0) * extents_.extent(1);
-        }
-        constexpr size_t operator()(size_t k, size_t n) const {
-            size_t k_outer = k / 4;
-            size_t k_inner = k % 4;
-            size_t n_block = n / BlockN;
-            size_t n_offset = n % BlockN;
-            size_t blocks_per_row = (extents_.extent(1) + BlockN - 1) / BlockN;
-            return (k_outer * blocks_per_row * BlockN * 4) + (n_block * BlockN * 4) + (n_offset * 4) + k_inner;
-        }
-    };
-
-    template<typename SrcView, typename DstView>
-    static void copy_from(const SrcView& src, DstView& dst, int dim, size_t offset, size_t size) {
-        if (dim == 0) {
-            for (size_t k = 0; k < size; k++) {
-                for (size_t n = 0; n < src.extent(1); n++) {
-                    dst[k, n] = src[offset + k, n];
-                }
-            }
-        } else {
-            for (size_t k = 0; k < src.extent(0); k++) {
-                for (size_t n = 0; n < size; n++) {
-                    dst[k, n] = src[k, offset + n];
-                }
-            }
-        }
-    }
-};
-
-export template<typename T>
-concept TensorStorage = requires(T t, const T ct, typename T::self_type& dest, int dim, size_t offset, size_t size) {
-    typename T::extents_type;
-    typename T::self_type;
-    { t.extent(dim) } -> std::same_as<size_t>;
-    { t.view() };
-    { ct.copy_to(dest) } -> std::same_as<void>;
-    { ct.copy_slice_to(dest, dim, offset, size) } -> std::same_as<void>;
-};
-
-export template<typename T, typename Extents, typename Layout>
-struct Tensor {
-    using self_type = Tensor<T, Extents, Layout>;
-    using extents_type = Extents;
-    using mapping_type = typename Layout::template mapping<Extents>;
-    using mdspan_type = std::mdspan<T, Extents, Layout>;
-
-    struct Deleter {
-        void operator()(T* p) const { std::free(p); }
-    };
-
-    mapping_type map;
-    std::unique_ptr<T[], Deleter> data;
-
-    Tensor(Extents extents) : map(extents) {
-        size_t size = map.required_span_size();
-        T* ptr = static_cast<T*>(std::aligned_alloc(64, size * sizeof(T)));
-        data = std::unique_ptr<T[], Deleter>(ptr);
-    }
-
-    Tensor(const Tensor&) = delete;
-    Tensor& operator=(const Tensor&) = delete;
-    Tensor(Tensor&&) = default;
-    Tensor& operator=(Tensor&&) = default;
-
-    size_t extent(size_t dim) const { return map.extents().extent(dim); }
-    auto view() { return mdspan_type{data.get(), map}; }
-    auto view() const { return std::mdspan<const T, Extents, Layout>{data.get(), map}; }
-
-    void copy_to(Tensor& dest) const {
-        std::memcpy(dest.data.get(), data.get(), map.required_span_size() * sizeof(T));
-    }
-
-    void copy_slice_to(Tensor& dest, int dim, size_t offset, size_t size) const {
-        auto src = view();
-        auto dst = dest.view();
-        Layout::copy_from(src, dst, dim, offset, size);
-    }
-};
-
-export template<typename T, typename DataExtents, typename DataLayout, typename QuantScaleType, size_t TileRows = 16, size_t TileCols = 16>
-struct QuantizedTensor {
-    using self_type = QuantizedTensor<T, DataExtents, DataLayout, QuantScaleType, TileRows, TileCols>;
-    using extents_type = DataExtents;
-    using scale_extents_type = std::dextents<size_t, 2>;
-
-    static constexpr size_t TILE_M = TileRows;
-    static constexpr size_t TILE_N = TileCols;
-
-    static constexpr size_t scale_for_dim(int dim) {
-        return (dim == 0) ? TILE_M : TILE_N;
-    }
-
-    Tensor<T, DataExtents, DataLayout> data;
-    Tensor<QuantScaleType, scale_extents_type, DataLayout> group_quant_scales;
-
-    QuantizedTensor(DataExtents data_extents)
-        : data(data_extents)
-        , group_quant_scales(scale_extents_type{data_extents.extent(0) / TILE_M, data_extents.extent(1) / TILE_N})
-    {}
-
-    QuantizedTensor(const QuantizedTensor&) = delete;
-    QuantizedTensor& operator=(const QuantizedTensor&) = delete;
-    QuantizedTensor(QuantizedTensor&&) = default;
-    QuantizedTensor& operator=(QuantizedTensor&&) = default;
-
-    size_t extent(size_t dim) const { return data.extent(dim); }
-    auto view() { return data.view(); }
-    auto view() const { return data.view(); }
-    auto scales_view() { return group_quant_scales.view(); }
-    auto scales_view() const { return group_quant_scales.view(); }
-
-    void copy_to(QuantizedTensor& dest) const {
-        data.copy_to(dest.data);
-        group_quant_scales.copy_to(dest.group_quant_scales);
-    }
-
-    void copy_slice_to(QuantizedTensor& dest, int dim, size_t offset, size_t size) const {
-        size_t scale = scale_for_dim(dim);
-        data.copy_slice_to(dest.data, dim, offset, size);
-        group_quant_scales.copy_slice_to(dest.group_quant_scales, dim, offset / scale, size / scale);
-    }
-};
+import moderntensor;
+import modernlayout;
 
 template<typename QTensor, typename RefView>
 void quantize_from_reference(QTensor& qtensor, const RefView& ref_view) {
@@ -223,7 +44,7 @@ void quantize_from_reference(QTensor& qtensor, const RefView& ref_view) {
 template<typename QTensorA, typename QTensorB, typename Extents>
 auto compute_quantized_matmul(const QTensorA& A_q, const QTensorB& B_q, size_t M, size_t K, size_t N) {
     constexpr size_t TILE_SIZE = 16;
-    auto C = Tensor<int32_t, Extents, RowMajorLayout>(Extents{M, N});
+    auto C = Tensor<int32_t, Extents, Layout::RowMajor>(Extents{M, N});
 
     for (size_t i = 0; i < M; i++) {
         for (size_t n = 0; n < N; n++) {
@@ -256,8 +77,8 @@ export void test_quantized_matmul() {
     constexpr size_t M = 64, K = 64, N = 64;
     using Extents = std::dextents<size_t, 2>;
 
-    auto A_ref = Tensor<int32_t, Extents, RowMajorLayout>(Extents{M, K});
-    auto B_ref = Tensor<int32_t, Extents, RowMajorLayout>(Extents{K, N});
+    auto A_ref = Tensor<int32_t, Extents, Layout::RowMajor>(Extents{M, K});
+    auto B_ref = Tensor<int32_t, Extents, Layout::RowMajor>(Extents{K, N});
 
     auto A_ref_view = A_ref.view();
     auto B_ref_view = B_ref.view();
@@ -274,7 +95,7 @@ export void test_quantized_matmul() {
         }
     }
 
-    auto C_ref = Tensor<int32_t, Extents, RowMajorLayout>(Extents{M, N});
+    auto C_ref = Tensor<int32_t, Extents, Layout::RowMajor>(Extents{M, N});
     auto C_ref_view = C_ref.view();
 
     for (size_t i = 0; i < M; i++) {
@@ -287,7 +108,7 @@ export void test_quantized_matmul() {
         }
     }
 
-    using QTensor = QuantizedTensor<int8_t, Extents, RowMajorLayout, AMXQ::QuantizationParams, 16, 16>;
+    using QTensor = QuantizedTensor<int8_t, Extents, Layout::RowMajor, AMXQ::QuantizationParams, 16, 16>;
     auto A_quant = QTensor(Extents{M, K});
     auto B_quant = QTensor(Extents{K, N});
 
@@ -329,8 +150,8 @@ export void test_quantized_vnni_slicing() {
     constexpr size_t M = 64, K = 128, N = 64;
     using Extents = std::dextents<size_t, 2>;
 
-    auto A_ref = Tensor<int32_t, Extents, RowMajorLayout>(Extents{M, K});
-    auto B_ref = Tensor<int32_t, Extents, RowMajorLayout>(Extents{K, N});
+    auto A_ref = Tensor<int32_t, Extents, Layout::RowMajor>(Extents{M, K});
+    auto B_ref = Tensor<int32_t, Extents, Layout::RowMajor>(Extents{K, N});
 
     for (size_t i = 0; i < M; i++) {
         for (size_t j = 0; j < K; j++) {
@@ -343,8 +164,8 @@ export void test_quantized_vnni_slicing() {
         }
     }
 
-    using QTensor = QuantizedTensor<int8_t, Extents, RowMajorLayout, AMXQ::QuantizationParams, 16, 16>;
-    using QTensorVNNI = QuantizedTensor<int8_t, Extents, VNNILayout<4, 16>, AMXQ::QuantizationParams, 16, 16>;
+    using QTensor = QuantizedTensor<int8_t, Extents, Layout::RowMajor, AMXQ::QuantizationParams, 16, 16>;
+    using QTensorVNNI = QuantizedTensor<int8_t, Extents, Layout::VNNI<4, 16>, AMXQ::QuantizationParams, 16, 16>;
 
     auto A_quant = QTensor(Extents{M, K});
     auto B_quant = QTensorVNNI(Extents{K, N});
@@ -363,7 +184,7 @@ export void test_quantized_vnni_slicing() {
 
     auto C_sliced = compute_quantized_matmul<QTensor, QTensorVNNI, Extents>(A_sliced, B_sliced, M, k_slice_size, N);
 
-    auto C_ref_partial = Tensor<int32_t, Extents, RowMajorLayout>(Extents{M, N});
+    auto C_ref_partial = Tensor<int32_t, Extents, Layout::RowMajor>(Extents{M, N});
     for (size_t i = 0; i < M; i++) {
         for (size_t n = 0; n < N; n++) {
             int32_t sum = 0;
