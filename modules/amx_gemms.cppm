@@ -3,12 +3,13 @@ module;
 #include <cstdint>
 #include <thread>
 #include <vector>
+#include <mdspan>
 #include <sched.h>
-export module matmul;
+export module amx_gemms;
 import tensor;
 import layout;
 
-export namespace amx {
+namespace amx {
     constexpr size_t TILE_M = 16;
     constexpr size_t TILE_K = 64;
     constexpr size_t TILE_N = 16;
@@ -25,12 +26,32 @@ struct TileConfig {
 };
 
 template<typename View>
+concept Int8RowMajor = requires(View v) {
+    requires std::same_as<typename View::element_type, int8_t>;
+    requires std::same_as<typename View::layout_type, Layout::RowMajor>;
+};
+
+template<typename View>
+concept Int8VNNI = requires(View v) {
+    requires std::same_as<typename View::element_type, int8_t>;
+    requires requires { typename View::layout_type::is_vnni_layout; };
+};
+
+template<typename View>
+concept Int32RowMajor = requires(View v) {
+    requires std::same_as<typename View::element_type, int32_t>;
+    requires std::same_as<typename View::layout_type, Layout::RowMajor>;
+};
+
+template<typename View>
 size_t stride_bytes(const View& v) {
     return v.extent(1) * sizeof(typename View::element_type);
 }
 
-export void matmul_amx_int8_blocked(Layout::Int8RowMajor auto A, Layout::Int8VNNI auto B, Layout::Int32RowMajor auto C,
-                                    int thread_id = 0, int num_threads = 1)
+export namespace cpugemm {
+
+void i8_i8_i32_blocked(Int8RowMajor auto A, Int8VNNI auto B, Int32RowMajor auto C,
+                       int thread_id = 0, int num_threads = 1)
 {
     using namespace amx;
     constexpr size_t M_STEP = 32;
@@ -104,4 +125,6 @@ export void matmul_amx_int8_blocked(Layout::Int8RowMajor auto A, Layout::Int8VNN
         }
     }
     _tile_release();
+}
+
 }

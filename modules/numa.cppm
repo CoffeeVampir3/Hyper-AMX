@@ -17,7 +17,7 @@ module;
 export module numa;
 import tensor;
 import layout;
-import matmul;
+import amx_gemms;
 
 export namespace Numa {
 
@@ -110,9 +110,7 @@ struct Replicated {
         for (int socket = 0; socket < NUM_SOCKETS; socket++) {
             int node = DualSocketConfig::primary_node_for_socket(socket);
             replicas[socket].emplace(extents, NumaAllocator<T>{node});
-            execute_on_socket(socket, 0, [&, socket] {
-                source.copy_to(replicas[socket].value());
-            });
+            source.copy_to(replicas[socket].value());
         }
     }
 
@@ -128,9 +126,7 @@ struct Replicated {
 
             int node = DualSocketConfig::primary_node_for_socket(socket);
             replicas[socket].emplace(extents, NumaAllocator<T>{node});
-            execute_on_socket(socket, 0, [&, socket] {
-                replicas[source_socket]->copy_to(replicas[socket].value());
-            });
+            replicas[source_socket]->copy_to(replicas[socket].value());
         }
     }
 
@@ -174,9 +170,7 @@ struct Partitioned {
         for (int socket = 0; socket < n_parts; socket++) {
             int node = DualSocketConfig::primary_node_for_socket(socket);
             partitions[socket].emplace(part_extents, NumaAllocator<T>{node});
-            execute_on_socket(socket, 0, [&, socket, part_size] {
-                source.copy_slice_to(partitions[socket].value(), partition_dim, socket * part_size, part_size);
-            });
+            source.copy_slice_to(partitions[socket].value(), partition_dim, socket * part_size, part_size);
         }
     }
 
@@ -213,12 +207,9 @@ template<typename T, typename Extents, typename Layout>
 using RowPartitioned = Partitioned<T, Extents, Layout, PartitionDim::Rows>;
 
 template<typename T, typename Extents, typename Layout>
-auto all_reduce_sum(Replicated<T, Extents, Layout>& partials, int target_socket, const DualSocketConfig& config) {
+void all_reduce_sum(Replicated<T, Extents, Layout>& partials, Tensor<T, Extents, Layout>& result, int target_socket, const DualSocketConfig& config) {
     size_t M = partials[0].extent(0);
     size_t N = partials[0].extent(1);
-
-    int node = DualSocketConfig::primary_node_for_socket(target_socket);
-    Tensor<T, Extents, Layout> result(Extents{M, N}, NumaAllocator<T>{node});
 
     int num_threads = config.physical_cores_per_socket;
     std::vector<std::jthread> threads;
@@ -246,16 +237,13 @@ auto all_reduce_sum(Replicated<T, Extents, Layout>& partials, int target_socket,
     }
 
     threads.clear();
-    return result;
 }
 
 template<typename T, typename Extents, typename Layout>
-auto all_gather(ColumnPartitioned<T, Extents, Layout>& partitioned) {
+void all_gather(ColumnPartitioned<T, Extents, Layout>& partitioned, Tensor<T, Extents, Layout>& result) {
     size_t M = partitioned[0].extent(0);
     size_t N_per_partition = partitioned[0].extent(1);
-    size_t N_total = N_per_partition * partitioned.num_partitions;
 
-    Tensor<T, Extents, Layout> result(Extents{M, N_total});
     auto result_view = result.view();
 
     for (int socket = 0; socket < partitioned.num_partitions; socket++) {
@@ -268,8 +256,6 @@ auto all_gather(ColumnPartitioned<T, Extents, Layout>& partitioned) {
             std::memcpy(dest_row, src_row, N_per_partition * sizeof(T));
         }
     }
-
-    return result;
 }
 
 void matmul_amx_parallel_impl(auto& A_container, auto& B_container, auto& C_container,
@@ -288,7 +274,7 @@ void matmul_amx_parallel_impl(auto& A_container, auto& B_container, auto& C_cont
         for (int local_tid = 0; local_tid < threads_per_socket; local_tid++) {
             threads.emplace_back([&, socket, local_tid, threads_per_socket] {
                 pin_to_socket(socket, local_tid);
-                matmul_amx_int8_blocked(
+                cpugemm::i8_i8_i32_blocked(
                     A_container.view(socket),
                     B_container.view(socket),
                     C_container.view(socket),

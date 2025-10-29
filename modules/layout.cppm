@@ -121,22 +121,4 @@ struct VNNI {
     }
 };
 
-template<typename View>
-concept Int8RowMajor = requires(View v) {
-    requires std::same_as<typename View::element_type, int8_t>;
-    requires std::same_as<typename View::layout_type, RowMajor>;
-};
-
-template<typename View>
-concept Int8VNNI = requires(View v) {
-    requires std::same_as<typename View::element_type, int8_t>;
-    requires requires { typename View::layout_type::is_vnni_layout; };
-};
-
-template<typename View>
-concept Int32RowMajor = requires(View v) {
-    requires std::same_as<typename View::element_type, int32_t>;
-    requires std::same_as<typename View::layout_type, RowMajor>;
-};
-
 }
