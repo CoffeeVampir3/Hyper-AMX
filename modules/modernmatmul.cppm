@@ -27,7 +27,6 @@ struct TileConfig {
 template<typename View>
 concept Int8RowMajor = requires(View v) {
     requires std::same_as<typename View::element_type, int8_t>;
-    requires std::same_as<typename View::layout_type, typename Layout::RowMajor::template mapping<typename View::extents_type>>;
 };
 
 template<typename View>
@@ -38,7 +37,6 @@ concept Int8VNNI = requires(View v) {
 template<typename View>
 concept Int32RowMajor = requires(View v) {
     requires std::same_as<typename View::element_type, int32_t>;
-    requires std::same_as<typename View::layout_type, typename Layout::RowMajor::template mapping<typename View::extents_type>>;
 };
 
 template<typename View>
@@ -93,10 +91,10 @@ export void matmul_amx_int8_blocked(Int8RowMajor auto A, Int8VNNI auto B, Int32R
                     _tile_zero(6);
                     _tile_zero(7);
                 } else {
-                    _tile_loadd(4, &C[m, n], C_stride);
-                    _tile_loadd(5, &C[m, n + TILE_N], C_stride);
-                    _tile_loadd(6, &C[m + TILE_M, n], C_stride);
-                    _tile_loadd(7, &C[m + TILE_M, n + TILE_N], C_stride);
+                    _tile_loadd(4, &(C[m, n]), C_stride);
+                    _tile_loadd(5, &(C[m, n + TILE_N]), C_stride);
+                    _tile_loadd(6, &(C[m + TILE_M, n]), C_stride);
+                    _tile_loadd(7, &(C[m + TILE_M, n + TILE_N]), C_stride);
                 }
                 for (size_t k = kb; k < k_block_end; k += TILE_K) {
                     auto a0_ptr = &A[m, k];
@@ -113,10 +111,10 @@ export void matmul_amx_int8_blocked(Int8RowMajor auto A, Int8VNNI auto B, Int32R
                     _tile_dpbssd(7, 1, 3);
                 }
 
-                _tile_stored(4, &C[m, n], C_stride);
-                _tile_stored(5, &C[m, n + TILE_N], C_stride);
-                _tile_stored(6, &C[m + TILE_M, n], C_stride);
-                _tile_stored(7, &C[m + TILE_M, n + TILE_N], C_stride);
+                _tile_stored(4, &(C[m, n]), C_stride);
+                _tile_stored(5, &(C[m, n + TILE_N]), C_stride);
+                _tile_stored(6, &(C[m + TILE_M, n]), C_stride);
+                _tile_stored(7, &(C[m + TILE_M, n + TILE_N]), C_stride);
             }
         }
     }

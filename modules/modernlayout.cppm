@@ -55,23 +55,47 @@ struct ColumnMajor {
     }
 };
 
-template<size_t BlockM, size_t BlockN>
+template<size_t N_BLOCK, size_t K_BLOCK, size_t TILE_N = 16, size_t TILE_K = 64, size_t VNNI_BLK = 4>
 struct VNNI {
     template<typename Extents>
     struct mapping {
         Extents extents_;
+
+        static constexpr size_t TILE_N_BYTES = TILE_N * VNNI_BLK;
+
         constexpr mapping(Extents e) : extents_(e) {}
         constexpr const Extents& extents() const { return extents_; }
         constexpr size_t required_span_size() const {
             return extents_.extent(0) * extents_.extent(1);
         }
         constexpr size_t operator()(size_t k, size_t n) const {
-            size_t k_outer = k / 4;
-            size_t k_inner = k % 4;
-            size_t n_block = n / BlockN;
-            size_t n_offset = n % BlockN;
-            size_t blocks_per_row = (extents_.extent(1) + BlockN - 1) / BlockN;
-            return (k_outer * blocks_per_row * BlockN * 4) + (n_block * BlockN * 4) + (n_offset * 4) + k_inner;
+            size_t K = extents_.extent(0);
+            size_t N = extents_.extent(1);
+
+            constexpr size_t effective_tile_n = (TILE_N > N_BLOCK) ? N_BLOCK : TILE_N;
+            constexpr size_t effective_vnni_blk = (VNNI_BLK > K_BLOCK) ? K_BLOCK : VNNI_BLK;
+            constexpr size_t tiles_per_n_block = N_BLOCK / effective_tile_n;
+            constexpr size_t vnni_per_k_block = K_BLOCK / effective_vnni_blk;
+
+            size_t n_block_idx = n / N_BLOCK;
+            size_t n_tile_idx = (tiles_per_n_block > 1) ? ((n / effective_tile_n) % tiles_per_n_block) : 0;
+            size_t n_in_tile = n % effective_tile_n;
+
+            size_t k_block_idx = k / K_BLOCK;
+            size_t k_vnni_idx = (vnni_per_k_block > 1) ? ((k / effective_vnni_blk) % vnni_per_k_block) : 0;
+            size_t k_in_vnni = k % effective_vnni_blk;
+
+            size_t n_block_size = (N - n_block_idx * N_BLOCK < N_BLOCK) ? (N - n_block_idx * N_BLOCK) : N_BLOCK;
+            size_t k_block_size = (K - k_block_idx * K_BLOCK < K_BLOCK) ? (K - k_block_idx * K_BLOCK) : K_BLOCK;
+
+            constexpr size_t effective_tile_n_bytes = effective_tile_n * effective_vnni_blk;
+
+            return n_block_idx * K
+                 + k_block_idx * (n_block_size * k_block_size)
+                 + n_tile_idx * (effective_tile_n * k_block_size)
+                 + k_vnni_idx * effective_tile_n_bytes
+                 + (n_in_tile * effective_vnni_blk)
+                 + k_in_vnni;
         }
     };
 

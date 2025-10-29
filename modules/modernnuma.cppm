@@ -97,6 +97,13 @@ struct Replicated {
     using storage_type = Tensor<T, Extents, Layout>;
     std::array<std::optional<storage_type>, NUM_SOCKETS> replicas;
 
+    Replicated(Extents extents, const DualSocketConfig& config) {
+        for (int socket = 0; socket < NUM_SOCKETS; socket++) {
+            int node = DualSocketConfig::primary_node_for_socket(socket);
+            replicas[socket].emplace(extents, NumaAllocator<T>{node});
+        }
+    }
+
     template<TensorStorage Source>
     Replicated(const Source& source, const DualSocketConfig& config) {
         auto extents = source.view().extents();
@@ -145,6 +152,15 @@ struct Partitioned {
     using storage_type = Tensor<T, Extents, Layout>;
     std::array<std::optional<storage_type>, MAX_SOCKETS> partitions;
     int num_partitions;
+
+    Partitioned(Extents extents, int n_parts, const DualSocketConfig& config)
+        : num_partitions(n_parts) {
+        auto part_extents = compute_partition_extents(extents, n_parts);
+        for (int socket = 0; socket < n_parts; socket++) {
+            int node = DualSocketConfig::primary_node_for_socket(socket);
+            partitions[socket].emplace(part_extents, NumaAllocator<T>{node});
+        }
+    }
 
     template<TensorStorage Source>
     Partitioned(const Source& source, int n_parts, const DualSocketConfig& config)
@@ -256,9 +272,8 @@ auto all_gather(ColumnPartitioned<T, Extents, Layout>& partitioned) {
     return result;
 }
 
-template<typename A_Container, typename B_Container, typename C_Container>
 void matmul_amx_parallel_impl(auto& A_container, auto& B_container, auto& C_container,
-                               const DualSocketConfig& config)
+                              const DualSocketConfig& config)
 {
     int num_sockets = B_container.num_partitions;
     size_t N = C_container[0].extent(1);
