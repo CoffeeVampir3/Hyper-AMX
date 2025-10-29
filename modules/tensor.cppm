@@ -5,7 +5,7 @@ module;
 #include <mdspan>
 #include <memory>
 #include <functional>
-export module moderntensor;
+export module tensor;
 
 export template<typename T>
 concept TensorStorage = requires(T t, int dim) {

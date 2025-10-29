@@ -14,10 +14,10 @@ module;
 #include <mdspan>
 #include <numa.h>
 #include <numaif.h>
-export module modernnuma;
-import moderntensor;
-import modernlayout;
-import modernmatmul;
+export module numa;
+import tensor;
+import layout;
+import matmul;
 
 export namespace Numa {
 

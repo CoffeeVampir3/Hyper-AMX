@@ -1,6 +1,6 @@
 #include <print>
-import qtensor;
-import modern_matmul_correctness;
+import tensor_tests;
+import matmul_correctness;
 
 int main() {
     std::println("=== AMX Test Suite ===\n");

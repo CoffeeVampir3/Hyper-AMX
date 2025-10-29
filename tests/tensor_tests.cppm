@@ -7,10 +7,10 @@ module;
 #include <cstdint>
 #include <print>
 #include <cmath>
-export module qtensor;
+export module tensor_tests;
 import quantization;
-import moderntensor;
-import modernlayout;
+import tensor;
+import layout;
 
 template<typename QTensor, typename RefView>
 void quantize_from_reference(QTensor& qtensor, const RefView& ref_view) {

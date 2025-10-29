@@ -4,9 +4,9 @@ module;
 #include <thread>
 #include <vector>
 #include <sched.h>
-export module modernmatmul;
-import moderntensor;
-import modernlayout;
+export module matmul;
+import tensor;
+import layout;
 
 export namespace amx {
     constexpr size_t TILE_M = 16;

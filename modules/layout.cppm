@@ -3,7 +3,7 @@ module;
 #include <cstring>
 #include <concepts>
 #include <mdspan>
-export module modernlayout;
+export module layout;
 
 export namespace Layout {
 

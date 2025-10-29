@@ -5,11 +5,11 @@ module;
 #include <unistd.h>
 #include <cmath>
 #include <mdspan>
-export module modern_matmul_correctness;
-import moderntensor;
-import modernlayout;
-import modernmatmul;
-import modernnuma;
+export module matmul_correctness;
+import tensor;
+import layout;
+import matmul;
+import numa;
 
 using namespace Numa;
 
