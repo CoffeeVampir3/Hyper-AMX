@@ -17,6 +17,7 @@ module;
 export module modernnuma;
 import moderntensor;
 import modernlayout;
+import modernmatmul;
 
 export namespace Numa {
 
@@ -253,6 +254,59 @@ auto all_gather(ColumnPartitioned<T, Extents, Layout>& partitioned) {
     }
 
     return result;
+}
+
+template<typename A_Container, typename B_Container, typename C_Container>
+void matmul_amx_parallel_impl(auto& A_container, auto& B_container, auto& C_container,
+                               const DualSocketConfig& config)
+{
+    int num_sockets = B_container.num_partitions;
+    size_t N = C_container[0].extent(1);
+    constexpr size_t N_STEP = 32;
+    int max_threads_for_work = std::max(1, static_cast<int>(N / N_STEP));
+    int threads_per_socket = std::min(config.physical_cores_per_socket, max_threads_for_work);
+
+    std::vector<std::jthread> threads;
+    threads.reserve(num_sockets * threads_per_socket);
+
+    for (int socket = 0; socket < num_sockets; socket++) {
+        for (int local_tid = 0; local_tid < threads_per_socket; local_tid++) {
+            threads.emplace_back([&, socket, local_tid, threads_per_socket] {
+                pin_to_socket(socket, local_tid);
+                matmul_amx_int8_blocked(
+                    A_container.view(socket),
+                    B_container.view(socket),
+                    C_container.view(socket),
+                    local_tid,
+                    threads_per_socket
+                );
+            });
+        }
+    }
+}
+
+template<typename TA, typename ExtentsA, typename LayoutA,
+         typename TB, typename ExtentsB, typename LayoutB,
+         typename TC, typename ExtentsC, typename LayoutC>
+void matmul_amx_column_parallel(
+    Replicated<TA, ExtentsA, LayoutA>& A_repl,
+    ColumnPartitioned<TB, ExtentsB, LayoutB>& B_part,
+    ColumnPartitioned<TC, ExtentsC, LayoutC>& C_part,
+    const DualSocketConfig& config)
+{
+    matmul_amx_parallel_impl(A_repl, B_part, C_part, config);
+}
+
+template<typename TA, typename ExtentsA, typename LayoutA,
+         typename TB, typename ExtentsB, typename LayoutB,
+         typename TC, typename ExtentsC, typename LayoutC>
+void matmul_amx_row_parallel(
+    ColumnPartitioned<TA, ExtentsA, LayoutA>& A_part,
+    RowPartitioned<TB, ExtentsB, LayoutB>& B_part,
+    Replicated<TC, ExtentsC, LayoutC>& C_partials,
+    const DualSocketConfig& config)
+{
+    matmul_amx_parallel_impl(A_part, B_part, C_partials, config);
 }
 
 }

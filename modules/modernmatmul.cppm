@@ -4,9 +4,9 @@ module;
 #include <thread>
 #include <vector>
 #include <sched.h>
-export module matmul;
-import tensor;
-import tensor_utils;
+export module modernmatmul;
+import moderntensor;
+import modernlayout;
 
 export namespace amx {
     constexpr size_t TILE_M = 16;
@@ -23,6 +23,28 @@ struct TileConfig {
     uint16_t colsb[16];
     uint8_t rows[16];
 };
+
+template<typename View>
+concept Int8RowMajor = requires(View v) {
+    requires std::same_as<typename View::element_type, int8_t>;
+    requires std::same_as<typename View::layout_type, typename Layout::RowMajor::template mapping<typename View::extents_type>>;
+};
+
+template<typename View>
+concept Int8VNNI = requires(View v) {
+    requires std::same_as<typename View::element_type, int8_t>;
+};
+
+template<typename View>
+concept Int32RowMajor = requires(View v) {
+    requires std::same_as<typename View::element_type, int32_t>;
+    requires std::same_as<typename View::layout_type, typename Layout::RowMajor::template mapping<typename View::extents_type>>;
+};
+
+template<typename View>
+size_t stride_bytes(const View& v) {
+    return v.extent(1) * sizeof(typename View::element_type);
+}
 
 export void matmul_amx_int8_blocked(Int8RowMajor auto A, Int8VNNI auto B, Int32RowMajor auto C,
                                     int thread_id = 0, int num_threads = 1)
@@ -71,16 +93,16 @@ export void matmul_amx_int8_blocked(Int8RowMajor auto A, Int8VNNI auto B, Int32R
                     _tile_zero(6);
                     _tile_zero(7);
                 } else {
-                    _tile_loadd(4, C.data_handle() + C.mapping()(m, n), C_stride);
-                    _tile_loadd(5, C.data_handle() + C.mapping()(m, n + TILE_N), C_stride);
-                    _tile_loadd(6, C.data_handle() + C.mapping()(m + TILE_M, n), C_stride);
-                    _tile_loadd(7, C.data_handle() + C.mapping()(m + TILE_M, n + TILE_N), C_stride);
+                    _tile_loadd(4, &C[m, n], C_stride);
+                    _tile_loadd(5, &C[m, n + TILE_N], C_stride);
+                    _tile_loadd(6, &C[m + TILE_M, n], C_stride);
+                    _tile_loadd(7, &C[m + TILE_M, n + TILE_N], C_stride);
                 }
                 for (size_t k = kb; k < k_block_end; k += TILE_K) {
-                    auto a0_ptr = A.data_handle() + A.mapping()(m, k);
-                    auto a1_ptr = A.data_handle() + A.mapping()(m + TILE_M, k);
-                    auto b0_ptr = B.data_handle() + B.mapping()(k, n);
-                    auto b1_ptr = B.data_handle() + B.mapping()(k, n + TILE_N);
+                    auto a0_ptr = &A[m, k];
+                    auto a1_ptr = &A[m + TILE_M, k];
+                    auto b0_ptr = &B[k, n];
+                    auto b1_ptr = &B[k, n + TILE_N];
                     _tile_loadd(0, a0_ptr, A_stride);
                     _tile_loadd(1, a1_ptr, A_stride);
                     _tile_loadd(2, b0_ptr, TILE_N * 4);
@@ -91,10 +113,10 @@ export void matmul_amx_int8_blocked(Int8RowMajor auto A, Int8VNNI auto B, Int32R
                     _tile_dpbssd(7, 1, 3);
                 }
 
-                _tile_stored(4, C.data_handle() + C.mapping()(m, n), C_stride);
-                _tile_stored(5, C.data_handle() + C.mapping()(m, n + TILE_N), C_stride);
-                _tile_stored(6, C.data_handle() + C.mapping()(m + TILE_M, n), C_stride);
-                _tile_stored(7, C.data_handle() + C.mapping()(m + TILE_M, n + TILE_N), C_stride);
+                _tile_stored(4, &C[m, n], C_stride);
+                _tile_stored(5, &C[m, n + TILE_N], C_stride);
+                _tile_stored(6, &C[m + TILE_M, n], C_stride);
+                _tile_stored(7, &C[m + TILE_M, n + TILE_N], C_stride);
             }
         }
     }
