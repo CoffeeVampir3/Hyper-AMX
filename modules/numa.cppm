@@ -226,12 +226,9 @@ void all_reduce_sum(Replicated<T, Extents, Layout>& partials, Tensor<T, Extents,
 
             auto result_view = result.view();
             for (size_t i = m_start; i < m_end; i++) {
-                for (size_t j = 0; j < N; j++) {
-                    auto sum = partials[0].view()[i, j];
-                    for (int socket = 1; socket < DualSocketConfig::NUM_SOCKETS; socket++) {
-                        sum += partials[socket].view()[i, j];
-                    }
-                    result_view[i, j] = sum;
+                std::memcpy(&result_view[i, 0], &partials[0].view()[i, 0], N * sizeof(T));
+                for (int socket = 1; socket < DualSocketConfig::NUM_SOCKETS; socket++) {
+                    avx512math::add(&result_view[i, 0], &partials[socket].view()[i, 0], &result_view[i, 0], N);
                 }
             }
         });
@@ -341,6 +338,140 @@ void silu_mul_requantize_parallel(
             });
         }
     }
+}
+
+template<typename TA, typename ExtentsA, typename LayoutA,
+         typename TB, typename ExtentsB, typename LayoutB,
+         typename TC, typename ExtentsC, typename LayoutC>
+void add_column_parallel(
+    ColumnPartitioned<TA, ExtentsA, LayoutA>& a,
+    ColumnPartitioned<TB, ExtentsB, LayoutB>& b,
+    ColumnPartitioned<TC, ExtentsC, LayoutC>& output,
+    const DualSocketConfig& config)
+{
+    int num_sockets = a.num_partitions;
+    size_t M = a[0].extent(0);
+    size_t N = a[0].extent(1);
+    int threads_per_socket = config.physical_cores_per_socket;
+    std::vector<std::jthread> threads;
+    threads.reserve(num_sockets * threads_per_socket);
+    for (int socket = 0; socket < num_sockets; socket++) {
+        for (int local_tid = 0; local_tid < threads_per_socket; local_tid++) {
+            threads.emplace_back([&, socket, local_tid, threads_per_socket] {
+                pin_to_socket(socket, local_tid);
+                size_t rows_per_thread = (M + threads_per_socket - 1) / threads_per_socket;
+                size_t m_start = local_tid * rows_per_thread;
+                size_t m_end = std::min(M, m_start + rows_per_thread);
+                auto a_view = a.view(socket);
+                auto b_view = b.view(socket);
+                auto out_view = output.view(socket);
+                for (size_t i = m_start; i < m_end; i++) {
+                    avx512math::add<avx512math::StoreHint::NonTemporal>(&a_view[i, 0], &b_view[i, 0], &out_view[i, 0], N);
+                }
+            });
+        }
+    }
+    threads.clear();
+    _mm_sfence();
+}
+
+template<typename TToken, typename ExtentsToken, typename LayoutToken,
+         typename TEmbed, typename ExtentsEmbed, typename LayoutEmbed,
+         typename TOutput, typename ExtentsOutput, typename LayoutOutput>
+void embedding_lookup_column_parallel(
+    Tensor<TToken, ExtentsToken, LayoutToken>& token_ids,
+    ColumnPartitioned<TEmbed, ExtentsEmbed, LayoutEmbed>& embedding_table,
+    ColumnPartitioned<TOutput, ExtentsOutput, LayoutOutput>& output,
+    const DualSocketConfig& config)
+{
+    int num_sockets = embedding_table.num_partitions;
+    std::vector<std::jthread> threads;
+    threads.reserve(num_sockets);
+    for (int socket = 0; socket < num_sockets; socket++) {
+        threads.emplace_back([&, socket] {
+            pin_to_socket(socket, 0);
+            kernel::embedding_lookup_bf16(token_ids.view(), embedding_table.view(socket), output.view(socket));
+        });
+    }
+    threads.clear();
+    _mm_sfence();
+}
+
+template<typename TInput, typename ExtentsInput, typename LayoutInput,
+         typename TWeight, typename ExtentsWeight, typename LayoutWeight,
+         typename TOutput, typename ExtentsOutput, typename LayoutOutput>
+void deepseek_rmsnorm_column_parallel(
+    ColumnPartitioned<TInput, ExtentsInput, LayoutInput>& input,
+    ColumnPartitioned<TWeight, ExtentsWeight, LayoutWeight>& weight,
+    ColumnPartitioned<TOutput, ExtentsOutput, LayoutOutput>& output,
+    const DualSocketConfig& config,
+    float eps = 1e-6f)
+{
+    int num_sockets = input.num_partitions;
+    size_t M = input[0].extent(0);
+    size_t N_local = input[0].extent(1);
+    size_t N_total = N_local * num_sockets;
+
+    Tensor<float, std::dextents<size_t, 2>, Layout::RowMajor> local_sum_sq(std::dextents<size_t, 2>{static_cast<size_t>(num_sockets), M});
+    Tensor<float, std::dextents<size_t, 1>, Layout::RowMajor> global_sum_sq(std::dextents<size_t, 1>{M});
+
+    std::vector<std::jthread> threads;
+    threads.reserve(num_sockets * config.physical_cores_per_socket);
+
+    // Phase 1: Compute local sum(x^2) on each socket
+    for (int socket = 0; socket < num_sockets; socket++) {
+        for (int local_tid = 0; local_tid < config.physical_cores_per_socket; local_tid++) {
+            threads.emplace_back([&, socket, local_tid] {
+                pin_to_socket(socket, local_tid);
+
+                size_t rows_per_thread = (M + config.physical_cores_per_socket - 1) / config.physical_cores_per_socket;
+                size_t m_start = local_tid * rows_per_thread;
+                size_t m_end = std::min(M, m_start + rows_per_thread);
+
+                for (size_t i = m_start; i < m_end; i++) {
+                    float sum_sq = kernel::deepseek_rmsnorm_compute_sum_sq_row_i32(&input.view(socket)[i, 0], N_local);
+                    local_sum_sq.view()[socket, i] = sum_sq;
+                }
+            });
+        }
+    }
+    threads.clear();
+
+    // Phase 2: All-reduce sum(x^2) across sockets
+    for (size_t i = 0; i < M; i++) {
+        float total_sum_sq = 0.0f;
+        for (int socket = 0; socket < num_sockets; socket++) {
+            total_sum_sq += local_sum_sq.view()[socket, i];
+        }
+        global_sum_sq.view()[i] = total_sum_sq;
+    }
+
+    // Phase 3: Apply normalization with global variance
+    threads.reserve(num_sockets * config.physical_cores_per_socket);
+    for (int socket = 0; socket < num_sockets; socket++) {
+        for (int local_tid = 0; local_tid < config.physical_cores_per_socket; local_tid++) {
+            threads.emplace_back([&, socket, local_tid] {
+                pin_to_socket(socket, local_tid);
+
+                size_t rows_per_thread = (M + config.physical_cores_per_socket - 1) / config.physical_cores_per_socket;
+                size_t m_start = local_tid * rows_per_thread;
+                size_t m_end = std::min(M, m_start + rows_per_thread);
+
+                for (size_t i = m_start; i < m_end; i++) {
+                    float mean_sq = global_sum_sq.view()[i] / static_cast<float>(N_total);
+                    float rstd = 1.0f / std::sqrt(mean_sq + eps);
+                    kernel::deepseek_rmsnorm_apply_row_i32(
+                        &input.view(socket)[i, 0],
+                        &weight.view(socket)[0, 0],
+                        &output.view(socket)[i, 0],
+                        N_local,
+                        rstd
+                    );
+                }
+            });
+        }
+    }
+    threads.clear();
 }
 
 }

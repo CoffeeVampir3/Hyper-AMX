@@ -20,6 +20,11 @@ import tensor;
 
 export namespace avx512math {
 
+enum class StoreHint {
+    Temporal,
+    NonTemporal
+};
+
 inline __m512 broadcast_fp16_to_fp32(_Float16 val) {
     uint16_t fp16_bits = std::bit_cast<uint16_t>(val);
     __m256i fp16_vec = _mm256_set1_epi16(fp16_bits);
@@ -31,6 +36,17 @@ inline __m512 fast_reciprocal_ps(__m512 a) {
     __m512 two = _mm512_set1_ps(2.0f);
     __m512 ax0 = _mm512_mul_ps(a, x0);
     __m512 correction = _mm512_sub_ps(two, ax0);
+    return _mm512_mul_ps(x0, correction);
+}
+
+inline __m512 fast_rsqrt_ps(__m512 a) {
+    __m512 x0 = _mm512_rsqrt14_ps(a);
+    __m512 half = _mm512_set1_ps(0.5f);
+    __m512 three_half = _mm512_set1_ps(1.5f);
+    __m512 x0_sq = _mm512_mul_ps(x0, x0);
+    __m512 a_x0_sq = _mm512_mul_ps(a, x0_sq);
+    __m512 half_a_x0_sq = _mm512_mul_ps(half, a_x0_sq);
+    __m512 correction = _mm512_sub_ps(three_half, half_a_x0_sq);
     return _mm512_mul_ps(x0, correction);
 }
 
@@ -59,6 +75,67 @@ inline __m512 silu_avx512(__m512 x) {
     __m512 one = _mm512_set1_ps(1.0f);
     __m512 denom = _mm512_add_ps(one, exp_neg_x);
     return _mm512_div_ps(x, denom);
+}
+
+template<size_t ElemsPerVec, auto LoadFn, auto AddFn, auto StoreFn, typename T>
+inline void add_impl(const T* a, const T* b, T* out, size_t count) {
+    size_t i = 0;
+    for (; i + ElemsPerVec <= count; i += ElemsPerVec) {
+        auto va = LoadFn(&a[i]);
+        auto vb = LoadFn(&b[i]);
+        auto vout = AddFn(va, vb);
+        StoreFn(&out[i], vout);
+    }
+    for (; i < count; i++) {
+        out[i] = a[i] + b[i];
+    }
+}
+
+template<StoreHint hint = StoreHint::Temporal>
+inline void add(const int32_t* a, const int32_t* b, int32_t* out, size_t count) {
+    if constexpr (hint == StoreHint::NonTemporal) {
+        add_impl<16, _mm512_loadu_si512, _mm512_add_epi32, _mm512_stream_si512>(a, b, out, count);
+    } else {
+        add_impl<16, _mm512_loadu_si512, _mm512_add_epi32, _mm512_storeu_si512>(a, b, out, count);
+    }
+}
+
+template<StoreHint hint = StoreHint::Temporal>
+inline void add(const int8_t* a, const int8_t* b, int8_t* out, size_t count) {
+    if constexpr (hint == StoreHint::NonTemporal) {
+        add_impl<64, _mm512_loadu_si512, _mm512_add_epi8, _mm512_stream_si512>(a, b, out, count);
+    } else {
+        add_impl<64, _mm512_loadu_si512, _mm512_add_epi8, _mm512_storeu_si512>(a, b, out, count);
+    }
+}
+
+template<StoreHint hint = StoreHint::Temporal>
+inline void add(const float* a, const float* b, float* out, size_t count) {
+    if constexpr (hint == StoreHint::NonTemporal) {
+        add_impl<16, _mm512_loadu_ps, _mm512_add_ps, _mm512_stream_ps>(a, b, out, count);
+    } else {
+        add_impl<16, _mm512_loadu_ps, _mm512_add_ps, _mm512_storeu_ps>(a, b, out, count);
+    }
+}
+
+template<StoreHint hint = StoreHint::Temporal>
+inline void add(const __bf16* a, const __bf16* b, __bf16* out, size_t count) {
+    if constexpr (hint == StoreHint::NonTemporal) {
+        add_impl<32, _mm512_loadu_pbh, _mm512_add_pbh, _mm512_stream_si512>(a, b, out, count);
+    } else {
+        add_impl<32, _mm512_loadu_pbh, _mm512_add_pbh, _mm512_storeu_pbh>(a, b, out, count);
+    }
+}
+
+// If using non-temporal ensure to use _mm_sfence() at the appropriate level.
+template<StoreHint hint = StoreHint::Temporal, typename ViewA, typename ViewB, typename ViewOut>
+inline void add(ViewA a, ViewB b, ViewOut out) {
+    using T = typename ViewOut::element_type;
+    size_t rows = out.extent(0);
+    size_t cols = out.extent(1);
+    for (size_t i = 0; i < rows; i++) {
+        add<hint>(&a[i, 0], &b[i, 0], &out[i, 0], cols);
+    }
 }
 
 }
@@ -230,6 +307,77 @@ void silu_mul_requantize(GateView gate, UpView up, OutView out,
                 tile_m, tile_n,
                 temp_i32_span
             );
+        }
+    }
+}
+
+// Compute sum of squares
+float deepseek_rmsnorm_compute_sum_sq_row_i32(const int32_t* input, size_t N) {
+    constexpr size_t vec_width = 16;
+    __m512 sum_sq_vec = _mm512_setzero_ps();
+
+    size_t i = 0;
+    for (; i + vec_width <= N; i += vec_width) {
+        __m512i x_i32 = _mm512_loadu_si512(&input[i]);
+        __m512 x_f32 = _mm512_cvtepi32_ps(x_i32);
+        __m512 x_sq = _mm512_mul_ps(x_f32, x_f32);
+        sum_sq_vec = _mm512_add_ps(sum_sq_vec, x_sq);
+    }
+
+    float sum_sq = _mm512_reduce_add_ps(sum_sq_vec);
+    for (; i < N; i++) {
+        float x = static_cast<float>(input[i]);
+        sum_sq += x * x;
+    }
+
+    return sum_sq;
+}
+
+void deepseek_rmsnorm_apply_row_i32(const int32_t* input, const float* weight, int32_t* output, size_t N, float rstd) {
+    constexpr size_t vec_width = 16;
+    __m512 rstd_vec = _mm512_set1_ps(rstd);
+
+    size_t i = 0;
+    for (; i + vec_width <= N; i += vec_width) {
+        __m512i x_i32 = _mm512_loadu_si512(&input[i]);
+        __m512 x_f32 = _mm512_cvtepi32_ps(x_i32);
+        __m512 w_f32 = _mm512_loadu_ps(&weight[i]);
+        __m512 normalized = _mm512_mul_ps(x_f32, rstd_vec);
+        __m512 scaled = _mm512_mul_ps(normalized, w_f32);
+        __m512i out_i32 = _mm512_cvt_roundps_epi32(scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        _mm512_storeu_si512(&output[i], out_i32);
+    }
+
+    for (; i < N; i++) {
+        float x = static_cast<float>(input[i]);
+        float normalized = x * rstd;
+        float scaled = normalized * weight[i];
+        output[i] = static_cast<int32_t>(std::round(scaled));
+    }
+}
+
+template<typename TokenView, typename EmbeddingView, typename OutputView>
+void embedding_lookup_bf16(TokenView token_ids, EmbeddingView embedding_table, OutputView output) {
+    constexpr size_t vec_width = 32;
+    size_t num_tokens = token_ids.extent(0);
+    size_t hidden_size = embedding_table.extent(1);
+    for (size_t tok = 0; tok < num_tokens; tok++) {
+        int32_t token_id = token_ids[tok];
+        size_t i = 0;
+        for (; i + vec_width <= hidden_size; i += vec_width) {
+            __m512i bf16_raw = _mm512_loadu_si512((__m512i*)&embedding_table[token_id, i]);
+            __m256bh bf16_lo = _mm512_castsi512_si256(bf16_raw);
+            __m256bh bf16_hi = _mm512_extracti64x4_epi64(bf16_raw, 1);
+            __m512 f32_lo = _mm512_cvtpbh_ps(bf16_lo);
+            __m512 f32_hi = _mm512_cvtpbh_ps(bf16_hi);
+            __m512i i32_lo = _mm512_cvt_roundps_epi32(f32_lo, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            __m512i i32_hi = _mm512_cvt_roundps_epi32(f32_hi, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            _mm512_stream_si512((__m512i*)&output[tok, i], i32_lo);
+            _mm512_stream_si512((__m512i*)&output[tok, i + 16], i32_hi);
+        }
+        for (; i < hidden_size; i++) {
+            float f = static_cast<float>(embedding_table[token_id, i]);
+            output[tok, i] = static_cast<int32_t>(std::round(f));
         }
     }
 }
