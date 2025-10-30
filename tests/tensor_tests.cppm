@@ -8,9 +8,11 @@ module;
 #include <print>
 #include <cmath>
 export module tensor_tests;
-import quantization;
+import avx512;
 import tensor;
 import layout;
+
+using namespace quantization;
 
 template<typename QTensor, typename RefView>
 void quantize_from_reference(QTensor& qtensor, const RefView& ref_view) {
@@ -29,13 +31,13 @@ void quantize_from_reference(QTensor& qtensor, const RefView& ref_view) {
                 }
             }
             std::mdspan<const int32_t, std::extents<size_t, 16, 16>> tile_view(&tile_data[0][0]);
-            auto params = AMXQ::compute_quantization_params(tile_view);
+            auto params = compute_quantization_params(tile_view);
             scales_view[tile_i, tile_j] = params;
 
             for (size_t i = 0; i < TILE_SIZE; i++) {
                 for (size_t j = 0; j < TILE_SIZE; j++) {
                     data_view[tile_i * TILE_SIZE + i, tile_j * TILE_SIZE + j] =
-                        AMXQ::quantize_scalar(tile_data[i][j], params.bias, params.scale);
+                        quantize_scalar(tile_data[i][j], params.bias, params.scale);
                 }
             }
         }
@@ -61,8 +63,8 @@ auto compute_quantized_matmul(const QTensorA& A_q, const QTensorB& B_q, size_t M
                 int8_t a_q = A_q.data.view()[i, k];
                 int8_t b_q = B_q.data.view()[k, n];
 
-                int32_t a_deq = AMXQ::dequantize_scalar(a_q, a_params.bias, a_params.scale);
-                int32_t b_deq = AMXQ::dequantize_scalar(b_q, b_params.bias, b_params.scale);
+                int32_t a_deq = dequantize_scalar(a_q, a_params.bias, a_params.scale);
+                int32_t b_deq = dequantize_scalar(b_q, b_params.bias, b_params.scale);
 
                 sum += a_deq * b_deq;
             }
@@ -109,7 +111,7 @@ export void test_quantized_matmul() {
         }
     }
 
-    using QTensor = QuantizedTensor<int8_t, Extents, Layout::RowMajor, AMXQ::QuantizationParams, 16, 16>;
+    using QTensor = QuantizedTensor<int8_t, Extents, Layout::RowMajor, QuantizationParams, 16, 16>;
     auto A_quant = QTensor(Extents{M, K});
     auto B_quant = QTensor(Extents{K, N});
 
@@ -165,8 +167,8 @@ export void test_quantized_vnni_slicing() {
         }
     }
 
-    using QTensor = QuantizedTensor<int8_t, Extents, Layout::RowMajor, AMXQ::QuantizationParams, 16, 16>;
-    using QTensorVNNI = QuantizedTensor<int8_t, Extents, Layout::VNNI<4, 16>, AMXQ::QuantizationParams, 16, 16>;
+    using QTensor = QuantizedTensor<int8_t, Extents, Layout::RowMajor, QuantizationParams, 16, 16>;
+    using QTensorVNNI = QuantizedTensor<int8_t, Extents, Layout::VNNI<4, 16>, QuantizationParams, 16, 16>;
 
     auto A_quant = QTensor(Extents{M, K});
     auto B_quant = QTensorVNNI(Extents{K, N});

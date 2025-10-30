@@ -4,7 +4,9 @@ module;
 #include <concepts>
 #include <mdspan>
 export module layout;
-import tensor_utils;
+import avx512;
+
+using namespace avx512;
 
 export namespace Layout {
 
@@ -23,11 +25,11 @@ struct RowMajor {
         using T = typename DstView::element_type;
 
         if (dim == 0) {
-            utils::contiguous_copy(dst.data_handle(),
+            contiguous_copy(dst.data_handle(),
                                    src.data_handle() + offset * src.extent(1),
                                    size * src.extent(1));
         } else {
-            utils::element_wise_copy_2d(src, dst, 0, offset, src.extent(0), size);
+            element_wise_copy_2d(src, dst, 0, offset, src.extent(0), size);
         }
     }
 };
@@ -41,11 +43,11 @@ struct ColumnMajor {
         using T = typename DstView::element_type;
 
         if (dim == 1) {
-            utils::contiguous_copy(dst.data_handle(),
+            contiguous_copy(dst.data_handle(),
                                    src.data_handle() + offset * src.extent(0),
                                    size * src.extent(0));
         } else {
-            utils::element_wise_copy_2d(src, dst, offset, 0, size, src.extent(1));
+            element_wise_copy_2d(src, dst, offset, 0, size, src.extent(1));
         }
     }
 };
@@ -101,9 +103,9 @@ struct VNNI {
     template<typename SrcView, typename DstView>
     static void copy_from(const SrcView& src, DstView& dst, int dim, size_t offset, size_t size) {
         if (dim == 0) {
-            utils::element_wise_copy_2d(src, dst, offset, 0, size, src.extent(1));
+            element_wise_copy_2d(src, dst, offset, 0, size, src.extent(1));
         } else {
-            utils::element_wise_copy_2d(src, dst, 0, offset, src.extent(0), size);
+            element_wise_copy_2d(src, dst, 0, offset, src.extent(0), size);
         }
     }
 };

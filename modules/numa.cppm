@@ -18,7 +18,7 @@ export module numa;
 import tensor;
 import layout;
 import amx_gemms;
-import kernel;
+import avx512;
 
 export namespace Numa {
 

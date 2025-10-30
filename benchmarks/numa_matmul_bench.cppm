@@ -8,9 +8,10 @@ import tensor;
 import layout;
 import amx_gemms;
 import numa;
-import tensor_utils;
+import avx512;
 
 using namespace Numa;
+using namespace avx512;
 
 constexpr size_t M = 4096;
 constexpr size_t K = 4096;
@@ -22,7 +23,7 @@ using Extents2D = std::dextents<size_t, 2>;
 using VNNILayout = Layout::VNNI<256, 4096>;
 
 export void run_numa_matmul_bench() {
-    if (!utils::request_amx()) {
+    if (!request_amx()) {
         std::println("Failed to request AMX permissions");
         return;
     }
@@ -35,8 +36,8 @@ export void run_numa_matmul_bench() {
 
     Tensor<int8_t, Extents2D, Layout::RowMajor> A_src(Extents2D{M, K});
     Tensor<int8_t, Extents2D, Layout::RowMajor> B_src(Extents2D{K, N});
-    utils::fill(A_src, [](size_t i, size_t j) { return static_cast<int8_t>((i + j) % 127 + 1); });
-    utils::fill(B_src, [](size_t i, size_t j) { return static_cast<int8_t>((i * j) % 127 + 1); });
+    fill(A_src, [](size_t i, size_t j) { return static_cast<int8_t>((i + j) % 127 + 1); });
+    fill(B_src, [](size_t i, size_t j) { return static_cast<int8_t>((i * j) % 127 + 1); });
 
     Tensor<int8_t, Extents2D, VNNILayout> B_vnni_src(Extents2D{K, N});
     auto B_vnni_view = B_vnni_src.view();

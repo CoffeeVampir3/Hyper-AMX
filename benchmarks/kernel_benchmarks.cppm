@@ -7,9 +7,10 @@ export module kernel_benchmarks;
 import tensor;
 import layout;
 import numa;
-import tensor_utils;
+import avx512;
 
 using namespace Numa;
+using namespace avx512;
 
 constexpr size_t M = 4096;
 constexpr size_t N = 4096;
@@ -28,8 +29,8 @@ export void run_kernel_benchmarks() {
 
     Tensor<int32_t, Extents2D, Layout::RowMajor> gate_src(Extents2D{M, N});
     Tensor<int32_t, Extents2D, Layout::RowMajor> up_src(Extents2D{M, N});
-    utils::fill(gate_src, [](size_t i, size_t j) { return static_cast<int32_t>((i + j) % 2000 - 1000); });
-    utils::fill(up_src, [](size_t i, size_t j) { return static_cast<int32_t>((i * j) % 2000 - 1000); });
+    fill(gate_src, [](size_t i, size_t j) { return static_cast<int32_t>((i + j) % 2000 - 1000); });
+    fill(up_src, [](size_t i, size_t j) { return static_cast<int32_t>((i * j) % 2000 - 1000); });
 
     double mem_per_set_mb = (M*N*4.0 * 2 + M*N*1.0) / (1024*1024);
     double total_mem_gb = (mem_per_set_mb * NUM_ITERS) / 1024;

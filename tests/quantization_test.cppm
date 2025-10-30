@@ -6,7 +6,9 @@ module;
 #include <algorithm>
 #include <mdspan>
 export module quantization_test;
-import quantization;
+import avx512;
+
+using namespace quantization;
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -50,13 +52,13 @@ void test_basic_roundtrip() {
     }
 
     std::mdspan<const int32_t, std::extents<size_t, 16, 16>> tile_view(&tile[0][0]);
-    auto params = AMXQ::compute_quantization_params(tile_view);
+    auto params = compute_quantization_params(tile_view);
 
     std::println("  [DEBUG] bias={}, scale={}", params.bias, (float)params.scale);
 
     int32_t original = 45'000'000;
-    int8_t quantized = AMXQ::quantize_scalar(original, params.bias, params.scale);
-    int32_t dequantized = AMXQ::dequantize_scalar(quantized, params.bias, params.scale);
+    int8_t quantized = quantize_scalar(original, params.bias, params.scale);
+    int32_t dequantized = dequantize_scalar(quantized, params.bias, params.scale);
 
     int32_t error = std::abs(dequantized - original);
     float error_pct = 100.0f * error / original;
@@ -75,8 +77,8 @@ void test_basic_roundtrip() {
 void test_zero_preservation() {
     int32_t original = 0;
     _Float16 scale = (_Float16)1.0f;
-    int8_t quantized = AMXQ::quantize_scalar(original, 0, scale);
-    int32_t dequantized = AMXQ::dequantize_scalar(quantized, 0, scale);
+    int8_t quantized = quantize_scalar(original, 0, scale);
+    int32_t dequantized = dequantize_scalar(quantized, 0, scale);
 
     assert_eq(quantized, 0, "zero_quantized");
     assert_eq(dequantized, 0, "zero_dequantized");
@@ -90,8 +92,8 @@ void test_symmetric() {
     int32_t positive = 25'000'000;
     int32_t negative = -25'000'000;
 
-    int8_t q_pos = AMXQ::quantize_scalar(bias + positive, bias, scale);
-    int8_t q_neg = AMXQ::quantize_scalar(bias + negative, bias, scale);
+    int8_t q_pos = quantize_scalar(bias + positive, bias, scale);
+    int8_t q_neg = quantize_scalar(bias + negative, bias, scale);
 
     bool symmetric = std::abs(q_pos + q_neg) <= 1;
     if (symmetric) {
@@ -108,7 +110,7 @@ void test_small_values() {
     _Float16 scale = (_Float16)(127.0f / 15'000'000);
 
     int32_t small = bias + 10'000;
-    int8_t quantized = AMXQ::quantize_scalar(small, bias, scale);
+    int8_t quantized = quantize_scalar(small, bias, scale);
 
     assert_in_range(quantized, -2, 2, "small_value_near_zero");
 }
@@ -127,9 +129,9 @@ void test_tile_quantization() {
 
     std::mdspan<const int32_t, std::extents<size_t, 16, 16>> input_view(&input[0][0]);
     std::mdspan<int32_t, std::extents<size_t, 16, 16>> reconstructed_view(&reconstructed[0][0]);
-    auto params = AMXQ::compute_quantization_params(input_view);
-    AMXQ::quantize_tile_avx512(input_view, &output[0][0], 16, params.bias, params.scale);
-    AMXQ::dequantize_tile_avx512(&output[0][0], 16, reconstructed_view, params.bias, params.scale);
+    auto params = compute_quantization_params(input_view);
+    quantize_tile_avx512(input_view, &output[0][0], 16, params.bias, params.scale);
+    dequantize_tile_avx512(&output[0][0], 16, reconstructed_view, params.bias, params.scale);
 
     int32_t max_error = 0;
     float max_error_pct = 0;
@@ -177,13 +179,13 @@ void test_tile_scalar_consistency() {
     }
 
     std::mdspan<const int32_t, std::extents<size_t, 16, 16>> input_view(&input[0][0]);
-    auto params = AMXQ::compute_quantization_params(input_view);
+    auto params = compute_quantization_params(input_view);
 
-    AMXQ::quantize_tile_avx512(input_view, &tile_output[0][0], 16, params.bias, params.scale);
+    quantize_tile_avx512(input_view, &tile_output[0][0], 16, params.bias, params.scale);
 
     for (int i = 0; i < 16; i++) {
         for (int j = 0; j < 16; j++) {
-            scalar_output[i][j] = AMXQ::quantize_scalar(input[i][j], params.bias, params.scale);
+            scalar_output[i][j] = quantize_scalar(input[i][j], params.bias, params.scale);
         }
     }
 
@@ -216,7 +218,7 @@ void test_parameter_computation() {
     }
 
     std::mdspan<const int32_t, std::extents<size_t, 16, 16>> tile_view(&tile[0][0]);
-    auto params = AMXQ::compute_quantization_params(tile_view);
+    auto params = compute_quantization_params(tile_view);
 
     int32_t expected_bias = 45'240'000;
     assert_near(params.bias, expected_bias, 500'000, "bias_computation");
@@ -240,9 +242,9 @@ void test_monotonicity() {
     int32_t v2 = 45'000'000;
     int32_t v3 = 59'000'000;
 
-    int8_t q1 = AMXQ::quantize_scalar(v1, bias, scale);
-    int8_t q2 = AMXQ::quantize_scalar(v2, bias, scale);
-    int8_t q3 = AMXQ::quantize_scalar(v3, bias, scale);
+    int8_t q1 = quantize_scalar(v1, bias, scale);
+    int8_t q2 = quantize_scalar(v2, bias, scale);
+    int8_t q3 = quantize_scalar(v3, bias, scale);
 
     bool monotonic = (q1 <= q2) && (q2 <= q3);
     if (monotonic) {
@@ -268,11 +270,11 @@ void test_amx_realistic_range() {
     }
 
     std::mdspan<const int32_t, std::extents<size_t, 16, 16>> tile_view(&tile[0][0]);
-    auto params = AMXQ::compute_quantization_params(tile_view);
+    auto params = compute_quantization_params(tile_view);
 
     int32_t mid = 0;
-    int8_t q_mid = AMXQ::quantize_scalar(mid, params.bias, params.scale);
-    int32_t dq_mid = AMXQ::dequantize_scalar(q_mid, params.bias, params.scale);
+    int8_t q_mid = quantize_scalar(mid, params.bias, params.scale);
+    int32_t dq_mid = dequantize_scalar(q_mid, params.bias, params.scale);
 
     int32_t error = std::abs(dq_mid - mid);
     float error_pct = 100.0f * error / 33'000'000;
@@ -297,14 +299,14 @@ void test_asymmetric_data() {
     }
 
     std::mdspan<const int32_t, std::extents<size_t, 16, 16>> tile_view(&tile[0][0]);
-    auto params = AMXQ::compute_quantization_params(tile_view);
+    auto params = compute_quantization_params(tile_view);
 
     alignas(64) int8_t quantized[16][16];
     alignas(64) int32_t recovered[16][16];
 
     std::mdspan<int32_t, std::extents<size_t, 16, 16>> recovered_view(&recovered[0][0]);
-    AMXQ::quantize_tile_avx512(tile_view, &quantized[0][0], 16, params.bias, params.scale);
-    AMXQ::dequantize_tile_avx512(&quantized[0][0], 16, recovered_view, params.bias, params.scale);
+    quantize_tile_avx512(tile_view, &quantized[0][0], 16, params.bias, params.scale);
+    dequantize_tile_avx512(&quantized[0][0], 16, recovered_view, params.bias, params.scale);
 
     int32_t max_error = 0;
     for (int i = 0; i < 16; i++) {

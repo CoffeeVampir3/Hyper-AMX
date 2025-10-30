@@ -6,7 +6,9 @@ module;
 #include <cstring>
 #include <mdspan>
 export module quantization_benchmark;
-import quantization;
+import avx512;
+
+using namespace quantization;
 
 template<typename T>
 inline void do_not_optimize(T&& value) {
@@ -28,7 +30,7 @@ export void run_quantization_benchmark() {
 
     alignas(64) int32_t* recon_tiles = new (std::align_val_t{64}) int32_t[NUM_RUNS * 16 * 16];
 
-    AMXQ::QuantizationParams* params = new AMXQ::QuantizationParams[NUM_RUNS];
+    QuantizationParams* params = new QuantizationParams[NUM_RUNS];
 
     std::mt19937 rng(42);
     std::uniform_int_distribution<int32_t> dist(30'000'000, 60'000'000);
@@ -41,13 +43,13 @@ export void run_quantization_benchmark() {
         }
 
         std::mdspan<const int32_t, std::extents<size_t, 16, 16>> tile_view(tile);
-        params[run] = AMXQ::compute_quantization_params(tile_view);
+        params[run] = compute_quantization_params(tile_view);
     }
 
     for (int run = 0; run < 100; run++) {
         std::mdspan<const int32_t, std::extents<size_t, 16, 16>> tile_in(&input_tiles[run * 16 * 16]);
         int8_t* tile_out = &output_tiles[run * 16 * 16];
-        AMXQ::quantize_tile_avx512(tile_in, tile_out, 16, params[run].bias, params[run].scale);
+        quantize_tile_avx512(tile_in, tile_out, 16, params[run].bias, params[run].scale);
     }
     clobber_memory();
 
@@ -57,7 +59,7 @@ export void run_quantization_benchmark() {
         std::mdspan<const int32_t, std::extents<size_t, 16, 16>> tile_in(&input_tiles[run * 16 * 16]);
         int8_t* tile_out = &output_tiles[run * 16 * 16];
 
-        AMXQ::quantize_tile_avx512(tile_in, tile_out, 16, params[run].bias, params[run].scale);
+        quantize_tile_avx512(tile_in, tile_out, 16, params[run].bias, params[run].scale);
         do_not_optimize(tile_out);
     }
     clobber_memory();
@@ -78,7 +80,7 @@ export void run_quantization_benchmark() {
     for (int run = 0; run < 100; run++) {
         int8_t* tile_in = &output_tiles[run * 16 * 16];
         std::mdspan<int32_t, std::extents<size_t, 16, 16>> tile_out(&recon_tiles[run * 16 * 16]);
-        AMXQ::dequantize_tile_avx512(tile_in, 16, tile_out, params[run].bias, params[run].scale);
+        dequantize_tile_avx512(tile_in, 16, tile_out, params[run].bias, params[run].scale);
     }
     clobber_memory();
 
@@ -88,7 +90,7 @@ export void run_quantization_benchmark() {
         int8_t* tile_in = &output_tiles[run * 16 * 16];
         std::mdspan<int32_t, std::extents<size_t, 16, 16>> tile_out(&recon_tiles[run * 16 * 16]);
 
-        AMXQ::dequantize_tile_avx512(tile_in, 16, tile_out, params[run].bias, params[run].scale);
+        dequantize_tile_avx512(tile_in, 16, tile_out, params[run].bias, params[run].scale);
         do_not_optimize(tile_out);
     }
     clobber_memory();

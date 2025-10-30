@@ -1,5 +1,6 @@
 Modules (.cppm) are in ./modules
 Tests (.cppm) are in ./tests
+Benchmarks (.cppm) are in ./benchmarks
 Documentation (.md) is in ./Documentation
 
 CMakeLists doesn't need to be updated for tests and modules, it automatically adds tests and modules.
