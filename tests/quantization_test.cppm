@@ -4,6 +4,7 @@ module;
 #include <cstdlib>
 #include <print>
 #include <algorithm>
+#include <mdspan>
 export module quantization_test;
 import quantization;
 
@@ -48,7 +49,8 @@ void test_basic_roundtrip() {
         }
     }
 
-    auto params = AMXQ::compute_quantization_params(tile);
+    std::mdspan<const int32_t, std::extents<size_t, 16, 16>> tile_view(&tile[0][0]);
+    auto params = AMXQ::compute_quantization_params(tile_view);
 
     std::println("  [DEBUG] bias={}, scale={}", params.bias, (float)params.scale);
 
@@ -123,9 +125,11 @@ void test_tile_quantization() {
         }
     }
 
-    auto params = AMXQ::compute_quantization_params(input);
-    AMXQ::quantize_tile_avx512(input, &output[0][0], 16, params.bias, params.scale);
-    AMXQ::dequantize_tile_avx512(&output[0][0], 16, reconstructed, params.bias, params.scale);
+    std::mdspan<const int32_t, std::extents<size_t, 16, 16>> input_view(&input[0][0]);
+    std::mdspan<int32_t, std::extents<size_t, 16, 16>> reconstructed_view(&reconstructed[0][0]);
+    auto params = AMXQ::compute_quantization_params(input_view);
+    AMXQ::quantize_tile_avx512(input_view, &output[0][0], 16, params.bias, params.scale);
+    AMXQ::dequantize_tile_avx512(&output[0][0], 16, reconstructed_view, params.bias, params.scale);
 
     int32_t max_error = 0;
     float max_error_pct = 0;
@@ -172,9 +176,10 @@ void test_tile_scalar_consistency() {
         }
     }
 
-    auto params = AMXQ::compute_quantization_params(input);
+    std::mdspan<const int32_t, std::extents<size_t, 16, 16>> input_view(&input[0][0]);
+    auto params = AMXQ::compute_quantization_params(input_view);
 
-    AMXQ::quantize_tile_avx512(input, &tile_output[0][0], 16, params.bias, params.scale);
+    AMXQ::quantize_tile_avx512(input_view, &tile_output[0][0], 16, params.bias, params.scale);
 
     for (int i = 0; i < 16; i++) {
         for (int j = 0; j < 16; j++) {
@@ -210,7 +215,8 @@ void test_parameter_computation() {
         }
     }
 
-    auto params = AMXQ::compute_quantization_params(tile);
+    std::mdspan<const int32_t, std::extents<size_t, 16, 16>> tile_view(&tile[0][0]);
+    auto params = AMXQ::compute_quantization_params(tile_view);
 
     int32_t expected_bias = 45'240'000;
     assert_near(params.bias, expected_bias, 500'000, "bias_computation");
@@ -261,7 +267,8 @@ void test_amx_realistic_range() {
         }
     }
 
-    auto params = AMXQ::compute_quantization_params(tile);
+    std::mdspan<const int32_t, std::extents<size_t, 16, 16>> tile_view(&tile[0][0]);
+    auto params = AMXQ::compute_quantization_params(tile_view);
 
     int32_t mid = 0;
     int8_t q_mid = AMXQ::quantize_scalar(mid, params.bias, params.scale);
@@ -289,13 +296,15 @@ void test_asymmetric_data() {
         }
     }
 
-    auto params = AMXQ::compute_quantization_params(tile);
+    std::mdspan<const int32_t, std::extents<size_t, 16, 16>> tile_view(&tile[0][0]);
+    auto params = AMXQ::compute_quantization_params(tile_view);
 
     alignas(64) int8_t quantized[16][16];
     alignas(64) int32_t recovered[16][16];
 
-    AMXQ::quantize_tile_avx512(tile, &quantized[0][0], 16, params.bias, params.scale);
-    AMXQ::dequantize_tile_avx512(&quantized[0][0], 16, recovered, params.bias, params.scale);
+    std::mdspan<int32_t, std::extents<size_t, 16, 16>> recovered_view(&recovered[0][0]);
+    AMXQ::quantize_tile_avx512(tile_view, &quantized[0][0], 16, params.bias, params.scale);
+    AMXQ::dequantize_tile_avx512(&quantized[0][0], 16, recovered_view, params.bias, params.scale);
 
     int32_t max_error = 0;
     for (int i = 0; i < 16; i++) {
@@ -318,8 +327,6 @@ void test_asymmetric_data() {
 }
 
 export void run_quantization_tests() {
-    std::println("=== Quantization Tests (Affine + FP16) ===\n");
-
     test_basic_roundtrip();
     test_zero_preservation();
     test_symmetric();
@@ -331,19 +338,8 @@ export void run_quantization_tests() {
     test_amx_realistic_range();
     test_asymmetric_data();
 
-    std::println("\n=== Quantization Test Results ===");
+    std::println("\n=== Quantization ===");
     std::println("Passed: {}", tests_passed);
     std::println("Failed: {}", tests_failed);
     std::println("Total:  {}", tests_passed + tests_failed);
-
-    if (tests_failed == 0) {
-        std::println("\n✓ All quantization tests passed!");
-        std::println("\nKey findings:");
-        std::println("  - Affine quantization: <0.15% error on asymmetric data");
-        std::println("  - Symmetric data: <0.6% error");
-        std::println("  - Tile operations: Consistent with scalar");
-        std::println("  - Storage: 6 bytes/tile (int32 bias + FP16 scale)");
-    } else {
-        std::println("\n✗ Some tests failed.");
-    }
 }

@@ -4,6 +4,7 @@ module;
 #include <print>
 #include <random>
 #include <cstring>
+#include <mdspan>
 export module quantization_benchmark;
 import quantization;
 
@@ -17,14 +18,9 @@ inline void clobber_memory() {
 }
 
 export void run_quantization_benchmark() {
-    std::println("=== Quantization Performance Benchmark ===\n");
-
     constexpr int NUM_RUNS = 10000;
     constexpr int TILE_SIZE_BYTES = 16 * 16 * sizeof(int32_t);
     constexpr int TILE_SIZE_INT8 = 16 * 16;
-
-    std::println("Allocating test data ({} tiles, ~{} MB)...", NUM_RUNS,
-                 (NUM_RUNS * TILE_SIZE_BYTES) / (1024 * 1024));
 
     alignas(64) int32_t* input_tiles = new (std::align_val_t{64}) int32_t[NUM_RUNS * 16 * 16];
 
@@ -34,7 +30,6 @@ export void run_quantization_benchmark() {
 
     AMXQ::QuantizationParams* params = new AMXQ::QuantizationParams[NUM_RUNS];
 
-    std::println("Initializing test data...");
     std::mt19937 rng(42);
     std::uniform_int_distribution<int32_t> dist(30'000'000, 60'000'000);
 
@@ -45,16 +40,12 @@ export void run_quantization_benchmark() {
             tile[i] = dist(rng);
         }
 
-        int32_t (*tile_2d)[16] = reinterpret_cast<int32_t(*)[16]>(tile);
-        params[run] = AMXQ::compute_quantization_params(tile_2d);
+        std::mdspan<const int32_t, std::extents<size_t, 16, 16>> tile_view(tile);
+        params[run] = AMXQ::compute_quantization_params(tile_view);
     }
 
-    std::println("Data initialized. Starting benchmarks...\n");
-
-    std::println("--- Quantization Benchmark (int32 → int8) ---");
-
     for (int run = 0; run < 100; run++) {
-        int32_t (*tile_in)[16] = reinterpret_cast<int32_t(*)[16]>(&input_tiles[run * 16 * 16]);
+        std::mdspan<const int32_t, std::extents<size_t, 16, 16>> tile_in(&input_tiles[run * 16 * 16]);
         int8_t* tile_out = &output_tiles[run * 16 * 16];
         AMXQ::quantize_tile_avx512(tile_in, tile_out, 16, params[run].bias, params[run].scale);
     }
@@ -63,7 +54,7 @@ export void run_quantization_benchmark() {
     auto quant_start = std::chrono::high_resolution_clock::now();
 
     for (int run = 0; run < NUM_RUNS; run++) {
-        int32_t (*tile_in)[16] = reinterpret_cast<int32_t(*)[16]>(&input_tiles[run * 16 * 16]);
+        std::mdspan<const int32_t, std::extents<size_t, 16, 16>> tile_in(&input_tiles[run * 16 * 16]);
         int8_t* tile_out = &output_tiles[run * 16 * 16];
 
         AMXQ::quantize_tile_avx512(tile_in, tile_out, 16, params[run].bias, params[run].scale);
@@ -84,11 +75,9 @@ export void run_quantization_benchmark() {
     std::println("  Bandwidth:         {:.2f} GB/s (input)", quant_gb_per_sec);
     std::println("  Compression ratio: {:.1f}× (1024B → 256B)", TILE_SIZE_BYTES / (float)TILE_SIZE_INT8);
 
-    std::println("\n--- Dequantization Benchmark (int8 → int32) ---");
-
     for (int run = 0; run < 100; run++) {
         int8_t* tile_in = &output_tiles[run * 16 * 16];
-        int32_t (*tile_out)[16] = reinterpret_cast<int32_t(*)[16]>(&recon_tiles[run * 16 * 16]);
+        std::mdspan<int32_t, std::extents<size_t, 16, 16>> tile_out(&recon_tiles[run * 16 * 16]);
         AMXQ::dequantize_tile_avx512(tile_in, 16, tile_out, params[run].bias, params[run].scale);
     }
     clobber_memory();
@@ -97,7 +86,7 @@ export void run_quantization_benchmark() {
 
     for (int run = 0; run < NUM_RUNS; run++) {
         int8_t* tile_in = &output_tiles[run * 16 * 16];
-        int32_t (*tile_out)[16] = reinterpret_cast<int32_t(*)[16]>(&recon_tiles[run * 16 * 16]);
+        std::mdspan<int32_t, std::extents<size_t, 16, 16>> tile_out(&recon_tiles[run * 16 * 16]);
 
         AMXQ::dequantize_tile_avx512(tile_in, 16, tile_out, params[run].bias, params[run].scale);
         do_not_optimize(tile_out);
@@ -116,8 +105,6 @@ export void run_quantization_benchmark() {
     std::println("  Throughput:        {:.2f} M tiles/sec", dequant_tiles_per_sec / 1e6);
     std::println("  Bandwidth:         {:.2f} GB/s (output)", dequant_gb_per_sec);
     std::println("  Expansion ratio:   {:.1f}× (256B → 1024B)", TILE_SIZE_BYTES / (float)TILE_SIZE_INT8);
-
-    std::println("\n--- Accuracy Verification ---");
 
     int64_t total_error = 0;
     int32_t max_error = 0;

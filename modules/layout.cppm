@@ -4,6 +4,7 @@ module;
 #include <concepts>
 #include <mdspan>
 export module layout;
+import tensor_utils;
 
 export namespace Layout {
 
@@ -22,14 +23,11 @@ struct RowMajor {
         using T = typename DstView::element_type;
 
         if (dim == 0) {
-            size_t row_bytes = src.extent(1) * sizeof(T);
-            std::memcpy(dst.data_handle(), src.data_handle() + offset * src.extent(1), size * row_bytes);
+            utils::contiguous_copy(dst.data_handle(),
+                                   src.data_handle() + offset * src.extent(1),
+                                   size * src.extent(1));
         } else {
-            for (size_t i = 0; i < src.extent(0); i++) {
-                for (size_t j = 0; j < size; j++) {
-                    dst[i, j] = src[i, offset + j];
-                }
-            }
+            utils::element_wise_copy_2d(src, dst, 0, offset, src.extent(0), size);
         }
     }
 };
@@ -43,14 +41,11 @@ struct ColumnMajor {
         using T = typename DstView::element_type;
 
         if (dim == 1) {
-            size_t col_bytes = src.extent(0) * sizeof(T);
-            std::memcpy(dst.data_handle(), src.data_handle() + offset * src.extent(0), size * col_bytes);
+            utils::contiguous_copy(dst.data_handle(),
+                                   src.data_handle() + offset * src.extent(0),
+                                   size * src.extent(0));
         } else {
-            for (size_t i = 0; i < size; i++) {
-                for (size_t j = 0; j < src.extent(1); j++) {
-                    dst[i, j] = src[offset + i, j];
-                }
-            }
+            utils::element_wise_copy_2d(src, dst, offset, 0, size, src.extent(1));
         }
     }
 };
@@ -106,17 +101,9 @@ struct VNNI {
     template<typename SrcView, typename DstView>
     static void copy_from(const SrcView& src, DstView& dst, int dim, size_t offset, size_t size) {
         if (dim == 0) {
-            for (size_t k = 0; k < size; k++) {
-                for (size_t n = 0; n < src.extent(1); n++) {
-                    dst[k, n] = src[offset + k, n];
-                }
-            }
+            utils::element_wise_copy_2d(src, dst, offset, 0, size, src.extent(1));
         } else {
-            for (size_t k = 0; k < src.extent(0); k++) {
-                for (size_t n = 0; n < size; n++) {
-                    dst[k, n] = src[k, offset + n];
-                }
-            }
+            utils::element_wise_copy_2d(src, dst, 0, offset, src.extent(0), size);
         }
     }
 };

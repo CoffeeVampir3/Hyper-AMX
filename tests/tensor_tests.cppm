@@ -28,7 +28,8 @@ void quantize_from_reference(QTensor& qtensor, const RefView& ref_view) {
                     tile_data[i][j] = ref_view[tile_i * TILE_SIZE + i, tile_j * TILE_SIZE + j];
                 }
             }
-            auto params = AMXQ::compute_quantization_params(tile_data);
+            std::mdspan<const int32_t, std::extents<size_t, 16, 16>> tile_view(&tile_data[0][0]);
+            auto params = AMXQ::compute_quantization_params(tile_view);
             scales_view[tile_i, tile_j] = params;
 
             for (size_t i = 0; i < TILE_SIZE; i++) {
