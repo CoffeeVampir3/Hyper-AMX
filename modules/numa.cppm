@@ -18,6 +18,7 @@ export module numa;
 import tensor;
 import layout;
 import amx_gemms;
+import kernel;
 
 export namespace Numa {
 
@@ -308,6 +309,38 @@ void matmul_amx_row_parallel(
     const DualSocketConfig& config)
 {
     matmul_amx_parallel_impl(A_part, B_part, C_partials, config);
+}
+
+template<typename TGate, typename ExtentsGate, typename LayoutGate,
+         typename TUp, typename ExtentsUp, typename LayoutUp,
+         typename TOut, typename ExtentsOut, typename LayoutOut>
+void silu_mul_requantize_parallel(
+    ColumnPartitioned<TGate, ExtentsGate, LayoutGate>& gate,
+    ColumnPartitioned<TUp, ExtentsUp, LayoutUp>& up,
+    ColumnPartitioned<TOut, ExtentsOut, LayoutOut>& output,
+    const DualSocketConfig& config)
+{
+    int num_sockets = gate.num_partitions;
+    size_t M = gate[0].extent(0);
+    constexpr size_t ROWS_PER_CORE = 4;
+    int max_threads_for_work = std::max(1, static_cast<int>((M + ROWS_PER_CORE - 1) / ROWS_PER_CORE));
+    int threads_per_socket = std::min(config.physical_cores_per_socket, max_threads_for_work);
+    std::vector<std::jthread> threads;
+    threads.reserve(num_sockets * threads_per_socket);
+    for (int socket = 0; socket < num_sockets; socket++) {
+        for (int local_tid = 0; local_tid < threads_per_socket; local_tid++) {
+            threads.emplace_back([&, socket, local_tid, threads_per_socket] {
+                pin_to_socket(socket, local_tid);
+                kernel::silu_mul_requantize(
+                    gate.view(socket),
+                    up.view(socket),
+                    output.view(socket),
+                    local_tid,
+                    threads_per_socket
+                );
+            });
+        }
+    }
 }
 
 }
