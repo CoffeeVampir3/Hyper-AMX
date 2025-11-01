@@ -1,26 +1,30 @@
 module;
-#include <cstddef>
-#include <cstdlib>
-#include <cstring>
+#include <algorithm>
 #include <array>
-#include <optional>
-#include <stdexcept>
+#include <concepts>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <format>
-#include <print>
-#include <thread>
-#include <vector>
 #include <memory>
+#include <optional>
+#include <print>
+#include <stdexcept>
+#include <thread>
+#include <type_traits>
+#include <vector>
 #include <sched.h>
-#include <mdspan>
 #include <numa.h>
 #include <numaif.h>
-export module numa;
-import tensor;
-import layout;
-import amx_gemms;
-import avx512;
+export module hyperamx.numa;
 
-export namespace Numa {
+import hyperamx.tensor;
+import hyperamx.avx512;
+
+export namespace numa {
+
+using namespace tensor;
+using namespace avx512;
 
 struct DualSocketConfig {
     static constexpr int NUM_SOCKETS = 2;
@@ -92,42 +96,76 @@ void execute_on_socket(int socket, int local_tid, Fn&& fn) {
     }).join();
 }
 
-template<typename T, typename Extents, typename Layout>
+template<typename Alloc>
+Alloc make_node_allocator(int node) {
+    if constexpr (requires { Alloc{node}; }) {
+        return Alloc{node};
+    } else if constexpr (std::is_default_constructible_v<Alloc>) {
+        return Alloc{};
+    } else {
+        static_assert(sizeof(Alloc) == 0, "Allocator must be constructible with NUMA node id");
+    }
+}
+
+template<typename TensorType>
+auto allocate_on_node(const typename TensorType::extents_type& extents, int node) {
+    if constexpr (tensor::QuantTensor<TensorType>) {
+        using Extents = typename TensorType::extents_type;
+        using Layout = typename TensorType::layout_type;
+        using DataTensor = typename TensorType::data_type;
+        using ScaleTensor = typename TensorType::scale_type;
+        using DataValue = typename DataTensor::element_type;
+        using ScaleValue = typename ScaleTensor::element_type;
+        constexpr size_t TileRows = TensorType::TILE_ROWS;
+        constexpr size_t TileCols = TensorType::TILE_COLS;
+        if constexpr (DataTensor::has_allocator && ScaleTensor::has_allocator) {
+            using DataAlloc = typename DataTensor::allocator_type;
+            using ScaleAlloc = typename ScaleTensor::allocator_type;
+            return make_quantized_tensor<DataValue, Extents, Layout, ScaleValue, TileRows, TileCols>(
+                extents,
+                make_node_allocator<DataAlloc>(node),
+                make_node_allocator<ScaleAlloc>(node));
+        } else {
+            return make_quantized_tensor<DataValue, Extents, Layout, ScaleValue, TileRows, TileCols>(extents);
+        }
+    } else {
+        static_assert(TensorType::has_allocator, "TensorType must own storage for NUMA allocation");
+        using Alloc = typename TensorType::allocator_type;
+        return TensorType(extents, make_node_allocator<Alloc>(node));
+    }
+}
+
+template<typename TensorType>
 struct Replicated {
     static constexpr int NUM_SOCKETS = DualSocketConfig::NUM_SOCKETS;
-    using storage_type = Tensor<T, Extents, Layout>;
-    std::array<std::optional<storage_type>, NUM_SOCKETS> replicas;
+    using extents_type = typename TensorType::extents_type;
 
-    Replicated(Extents extents, const DualSocketConfig& config) {
+    std::array<std::optional<TensorType>, NUM_SOCKETS> replicas;
+
+    Replicated(const extents_type& extents, const DualSocketConfig& config) {
         for (int socket = 0; socket < NUM_SOCKETS; socket++) {
             int node = DualSocketConfig::primary_node_for_socket(socket);
-            replicas[socket].emplace(extents, NumaAllocator<T>{node});
+            replicas[socket].emplace(allocate_on_node<TensorType>(extents, node));
         }
     }
 
-    template<TensorStorage Source>
-    Replicated(const Source& source, const DualSocketConfig& config) {
-        auto extents = source.view().extents();
+    Replicated(TensorType& source, const DualSocketConfig& config) {
+        auto extents = source.extents();
         for (int socket = 0; socket < NUM_SOCKETS; socket++) {
             int node = DualSocketConfig::primary_node_for_socket(socket);
-            replicas[socket].emplace(extents, NumaAllocator<T>{node});
-            source.copy_to(replicas[socket].value());
+            replicas[socket].emplace(allocate_on_node<TensorType>(extents, node));
+            copy_tensor(source, replicas[socket].value());
         }
     }
 
-    //Optimization specifically for all reduce sum case where we pin to a socket. We can avoid making a copy
-    //for the socket we just all-reduced to by specifying the source socket. Ensure to use this in tandem with
-    //all reduce sum.
-    Replicated(Tensor<T, Extents, Layout>&& source, int source_socket, const DualSocketConfig& config) {
+    Replicated(TensorType&& source, int source_socket, const DualSocketConfig& config) {
         replicas[source_socket].emplace(std::move(source));
-
-        auto extents = replicas[source_socket]->view().extents();
+        auto extents = replicas[source_socket]->extents();
         for (int socket = 0; socket < NUM_SOCKETS; socket++) {
             if (socket == source_socket) continue;
-
             int node = DualSocketConfig::primary_node_for_socket(socket);
-            replicas[socket].emplace(extents, NumaAllocator<T>{node});
-            replicas[source_socket]->copy_to(replicas[socket].value());
+            replicas[socket].emplace(allocate_on_node<TensorType>(extents, node));
+            copy_tensor(replicas[source_socket].value(), replicas[socket].value());
         }
     }
 
@@ -138,40 +176,42 @@ struct Replicated {
 
     auto& operator[](int socket) { return *replicas[socket]; }
     const auto& operator[](int socket) const { return *replicas[socket]; }
-    auto view(int socket) { return replicas[socket]->view(); }
-    auto view(int socket) const { return replicas[socket]->view(); }
+    auto span(int socket) { return replicas[socket]->span(); }
+    auto span(int socket) const { return replicas[socket]->span(); }
 };
 
-template<typename T, typename Extents, typename Layout, PartitionDim Dim>
+template<typename TensorType, PartitionDim Dim>
 struct Partitioned {
     static constexpr int MAX_SOCKETS = DualSocketConfig::NUM_SOCKETS;
     static constexpr int partition_dim = static_cast<int>(Dim);
-    using storage_type = Tensor<T, Extents, Layout>;
-    std::array<std::optional<storage_type>, MAX_SOCKETS> partitions;
+    using extents_type = typename TensorType::extents_type;
+
+    std::array<std::optional<TensorType>, MAX_SOCKETS> partitions;
     int num_partitions;
 
-    Partitioned(Extents extents, int n_parts, const DualSocketConfig& config)
-        : num_partitions(n_parts) {
+    Partitioned(const extents_type& extents, int n_parts, const DualSocketConfig& config)
+        : num_partitions(n_parts)
+    {
         auto part_extents = compute_partition_extents(extents, n_parts);
         for (int socket = 0; socket < n_parts; socket++) {
             int node = DualSocketConfig::primary_node_for_socket(socket);
-            partitions[socket].emplace(part_extents, NumaAllocator<T>{node});
+            partitions[socket].emplace(allocate_on_node<TensorType>(part_extents, node));
         }
     }
 
-    template<TensorStorage Source>
-    Partitioned(const Source& source, int n_parts, const DualSocketConfig& config)
-        : num_partitions(n_parts) {
+    Partitioned(TensorType& source, int n_parts, const DualSocketConfig& config)
+        : num_partitions(n_parts)
+    {
         size_t dim_size = source.extent(partition_dim);
         size_t part_size = dim_size / n_parts;
 
-        auto src_extents = source.view().extents();
+        auto src_extents = source.extents();
         auto part_extents = compute_partition_extents(src_extents, n_parts);
 
         for (int socket = 0; socket < n_parts; socket++) {
             int node = DualSocketConfig::primary_node_for_socket(socket);
-            partitions[socket].emplace(part_extents, NumaAllocator<T>{node});
-            source.copy_slice_to(partitions[socket].value(), partition_dim, socket * part_size, part_size);
+            partitions[socket].emplace(allocate_on_node<TensorType>(part_extents, node));
+            copy_tensor_slice(source, partitions[socket].value(), partition_dim, socket * part_size, part_size);
         }
     }
 
@@ -182,33 +222,38 @@ struct Partitioned {
 
     auto& operator[](int socket) { return *partitions[socket]; }
     const auto& operator[](int socket) const { return *partitions[socket]; }
-    auto view(int socket) { return partitions[socket]->view(); }
-    auto view(int socket) const { return partitions[socket]->view(); }
+    auto span(int socket) { return partitions[socket]->span(); }
+    auto span(int socket) const { return partitions[socket]->span(); }
 
 private:
-    static Extents compute_partition_extents(Extents full, int n_parts) {
-        if constexpr (Extents::rank() == 2) {
+    static extents_type compute_partition_extents(extents_type full, int n_parts) {
+        if constexpr (extents_type::rank() == 2) {
             size_t dim_size = full.extent(partition_dim);
             size_t part_size = dim_size / n_parts;
             if constexpr (partition_dim == 0) {
-                return Extents{part_size, full.extent(1)};
+                return extents_type{part_size, full.extent(1)};
             } else {
-                return Extents{full.extent(0), part_size};
+                return extents_type{full.extent(0), part_size};
             }
         } else {
-            static_assert(Extents::rank() == 2, "Only 2D tensors supported for partitioning");
+            static_assert(extents_type::rank() == 2, "Only 2D tensors supported for partitioning");
         }
     }
 };
 
-template<typename T, typename Extents, typename Layout>
-using ColumnPartitioned = Partitioned<T, Extents, Layout, PartitionDim::Columns>;
+template<typename TensorType>
+using ColumnPartitioned = Partitioned<TensorType, PartitionDim::Columns>;
 
-template<typename T, typename Extents, typename Layout>
-using RowPartitioned = Partitioned<T, Extents, Layout, PartitionDim::Rows>;
+template<typename TensorType>
+using RowPartitioned = Partitioned<TensorType, PartitionDim::Rows>;
 
-template<typename T, typename Extents, typename Layout>
-void all_reduce_sum(Replicated<T, Extents, Layout>& partials, Tensor<T, Extents, Layout>& result, int target_socket, const DualSocketConfig& config) {
+template<typename TensorType>
+void all_reduce_sum(Replicated<TensorType>& partials,
+                    TensorType& result,
+                    int target_socket,
+                    const DualSocketConfig& config)
+{
+    using Value = typename TensorType::element_type;
     size_t M = partials[0].extent(0);
     size_t N = partials[0].extent(1);
 
@@ -224,11 +269,13 @@ void all_reduce_sum(Replicated<T, Extents, Layout>& partials, Tensor<T, Extents,
             size_t m_start = tid * rows_per_thread;
             size_t m_end = std::min(M, m_start + rows_per_thread);
 
-            auto result_view = result.view();
+            auto result_view = result.span();
+            auto first = partials[0].span();
             for (size_t i = m_start; i < m_end; i++) {
-                std::memcpy(&result_view[i, 0], &partials[0].view()[i, 0], N * sizeof(T));
+                std::memcpy(&result_view[i, 0], &first[i, 0], N * sizeof(Value));
                 for (int socket = 1; socket < DualSocketConfig::NUM_SOCKETS; socket++) {
-                    avx512math::add(&result_view[i, 0], &partials[socket].view()[i, 0], &result_view[i, 0], N);
+                    auto partial_view = partials[socket].span();
+                    add(&result_view[i, 0], &partial_view[i, 0], &result_view[i, 0], N);
                 }
             }
         });
@@ -237,241 +284,26 @@ void all_reduce_sum(Replicated<T, Extents, Layout>& partials, Tensor<T, Extents,
     threads.clear();
 }
 
-template<typename T, typename Extents, typename Layout>
-void all_gather(ColumnPartitioned<T, Extents, Layout>& partitioned, Tensor<T, Extents, Layout>& result) {
+template<typename TensorType>
+void all_gather(ColumnPartitioned<TensorType>& partitioned,
+                TensorType& result)
+{
     size_t M = partitioned[0].extent(0);
     size_t N_per_partition = partitioned[0].extent(1);
 
-    auto result_view = result.view();
+    using Value = typename TensorType::element_type;
+    auto result_view = result.span();
 
     for (int socket = 0; socket < partitioned.num_partitions; socket++) {
         size_t col_offset = socket * N_per_partition;
-        auto src = partitioned.view(socket);
+        auto src = partitioned.span(socket);
 
         for (size_t i = 0; i < M; i++) {
-            T* dest_row = &result_view[i, col_offset];
-            const T* src_row = &src[i, 0];
-            std::memcpy(dest_row, src_row, N_per_partition * sizeof(T));
+            Value* dest_row = &result_view[i, col_offset];
+            const Value* src_row = &src[i, 0];
+            std::memcpy(dest_row, src_row, N_per_partition * sizeof(Value));
         }
     }
 }
 
-void matmul_amx_parallel_impl(auto& A_container, auto& B_container, auto& C_container,
-                              const DualSocketConfig& config)
-{
-    int num_sockets = B_container.num_partitions;
-    size_t N = C_container[0].extent(1);
-    constexpr size_t N_STEP = 32;
-    int max_threads_for_work = std::max(1, static_cast<int>(N / N_STEP));
-    int threads_per_socket = std::min(config.physical_cores_per_socket, max_threads_for_work);
-
-    std::vector<std::jthread> threads;
-    threads.reserve(num_sockets * threads_per_socket);
-
-    for (int socket = 0; socket < num_sockets; socket++) {
-        for (int local_tid = 0; local_tid < threads_per_socket; local_tid++) {
-            threads.emplace_back([&, socket, local_tid, threads_per_socket] {
-                pin_to_socket(socket, local_tid);
-                cpugemm::i8_i8_i32_blocked(
-                    A_container.view(socket),
-                    B_container.view(socket),
-                    C_container.view(socket),
-                    local_tid,
-                    threads_per_socket
-                );
-            });
-        }
-    }
-}
-
-template<typename TA, typename ExtentsA, typename LayoutA,
-         typename TB, typename ExtentsB, typename LayoutB,
-         typename TC, typename ExtentsC, typename LayoutC>
-void matmul_amx_column_parallel(
-    Replicated<TA, ExtentsA, LayoutA>& A_repl,
-    ColumnPartitioned<TB, ExtentsB, LayoutB>& B_part,
-    ColumnPartitioned<TC, ExtentsC, LayoutC>& C_part,
-    const DualSocketConfig& config)
-{
-    matmul_amx_parallel_impl(A_repl, B_part, C_part, config);
-}
-
-template<typename TA, typename ExtentsA, typename LayoutA,
-         typename TB, typename ExtentsB, typename LayoutB,
-         typename TC, typename ExtentsC, typename LayoutC>
-void matmul_amx_row_parallel(
-    ColumnPartitioned<TA, ExtentsA, LayoutA>& A_part,
-    RowPartitioned<TB, ExtentsB, LayoutB>& B_part,
-    Replicated<TC, ExtentsC, LayoutC>& C_partials,
-    const DualSocketConfig& config)
-{
-    matmul_amx_parallel_impl(A_part, B_part, C_partials, config);
-}
-
-template<typename TGate, typename ExtentsGate, typename LayoutGate,
-         typename TUp, typename ExtentsUp, typename LayoutUp,
-         typename TOut, typename ExtentsOut, typename LayoutOut>
-void silu_mul_requantize_parallel(
-    ColumnPartitioned<TGate, ExtentsGate, LayoutGate>& gate,
-    ColumnPartitioned<TUp, ExtentsUp, LayoutUp>& up,
-    ColumnPartitioned<TOut, ExtentsOut, LayoutOut>& output,
-    const DualSocketConfig& config)
-{
-    int num_sockets = gate.num_partitions;
-    size_t M = gate[0].extent(0);
-    constexpr size_t ROWS_PER_CORE = 4;
-    int max_threads_for_work = std::max(1, static_cast<int>((M + ROWS_PER_CORE - 1) / ROWS_PER_CORE));
-    int threads_per_socket = std::min(config.physical_cores_per_socket, max_threads_for_work);
-    std::vector<std::jthread> threads;
-    threads.reserve(num_sockets * threads_per_socket);
-    for (int socket = 0; socket < num_sockets; socket++) {
-        for (int local_tid = 0; local_tid < threads_per_socket; local_tid++) {
-            threads.emplace_back([&, socket, local_tid, threads_per_socket] {
-                pin_to_socket(socket, local_tid);
-                kernel::silu_mul_requantize(
-                    gate.view(socket),
-                    up.view(socket),
-                    output.view(socket),
-                    local_tid,
-                    threads_per_socket
-                );
-            });
-        }
-    }
-}
-
-template<typename TA, typename ExtentsA, typename LayoutA,
-         typename TB, typename ExtentsB, typename LayoutB,
-         typename TC, typename ExtentsC, typename LayoutC>
-void add_column_parallel(
-    ColumnPartitioned<TA, ExtentsA, LayoutA>& a,
-    ColumnPartitioned<TB, ExtentsB, LayoutB>& b,
-    ColumnPartitioned<TC, ExtentsC, LayoutC>& output,
-    const DualSocketConfig& config)
-{
-    int num_sockets = a.num_partitions;
-    size_t M = a[0].extent(0);
-    size_t N = a[0].extent(1);
-    int threads_per_socket = config.physical_cores_per_socket;
-    std::vector<std::jthread> threads;
-    threads.reserve(num_sockets * threads_per_socket);
-    for (int socket = 0; socket < num_sockets; socket++) {
-        for (int local_tid = 0; local_tid < threads_per_socket; local_tid++) {
-            threads.emplace_back([&, socket, local_tid, threads_per_socket] {
-                pin_to_socket(socket, local_tid);
-                size_t rows_per_thread = (M + threads_per_socket - 1) / threads_per_socket;
-                size_t m_start = local_tid * rows_per_thread;
-                size_t m_end = std::min(M, m_start + rows_per_thread);
-                auto a_view = a.view(socket);
-                auto b_view = b.view(socket);
-                auto out_view = output.view(socket);
-                for (size_t i = m_start; i < m_end; i++) {
-                    avx512math::add<avx512math::StoreHint::NonTemporal>(&a_view[i, 0], &b_view[i, 0], &out_view[i, 0], N);
-                }
-            });
-        }
-    }
-    threads.clear();
-    _mm_sfence();
-}
-
-template<typename TToken, typename ExtentsToken, typename LayoutToken,
-         typename TEmbed, typename ExtentsEmbed, typename LayoutEmbed,
-         typename TOutput, typename ExtentsOutput, typename LayoutOutput>
-void embedding_lookup_column_parallel(
-    Tensor<TToken, ExtentsToken, LayoutToken>& token_ids,
-    ColumnPartitioned<TEmbed, ExtentsEmbed, LayoutEmbed>& embedding_table,
-    ColumnPartitioned<TOutput, ExtentsOutput, LayoutOutput>& output,
-    const DualSocketConfig& config)
-{
-    int num_sockets = embedding_table.num_partitions;
-    std::vector<std::jthread> threads;
-    threads.reserve(num_sockets);
-    for (int socket = 0; socket < num_sockets; socket++) {
-        threads.emplace_back([&, socket] {
-            pin_to_socket(socket, 0);
-            kernel::embedding_lookup_bf16(token_ids.view(), embedding_table.view(socket), output.view(socket));
-        });
-    }
-    threads.clear();
-    _mm_sfence();
-}
-
-template<typename TInput, typename ExtentsInput, typename LayoutInput,
-         typename TWeight, typename ExtentsWeight, typename LayoutWeight,
-         typename TOutput, typename ExtentsOutput, typename LayoutOutput>
-void deepseek_rmsnorm_column_parallel(
-    ColumnPartitioned<TInput, ExtentsInput, LayoutInput>& input,
-    ColumnPartitioned<TWeight, ExtentsWeight, LayoutWeight>& weight,
-    ColumnPartitioned<TOutput, ExtentsOutput, LayoutOutput>& output,
-    const DualSocketConfig& config,
-    float eps = 1e-6f)
-{
-    int num_sockets = input.num_partitions;
-    size_t M = input[0].extent(0);
-    size_t N_local = input[0].extent(1);
-    size_t N_total = N_local * num_sockets;
-
-    Tensor<float, std::dextents<size_t, 2>, Layout::RowMajor> local_sum_sq(std::dextents<size_t, 2>{static_cast<size_t>(num_sockets), M});
-    Tensor<float, std::dextents<size_t, 1>, Layout::RowMajor> global_sum_sq(std::dextents<size_t, 1>{M});
-
-    std::vector<std::jthread> threads;
-    threads.reserve(num_sockets * config.physical_cores_per_socket);
-
-    // Phase 1: Compute local sum(x^2) on each socket
-    for (int socket = 0; socket < num_sockets; socket++) {
-        for (int local_tid = 0; local_tid < config.physical_cores_per_socket; local_tid++) {
-            threads.emplace_back([&, socket, local_tid] {
-                pin_to_socket(socket, local_tid);
-
-                size_t rows_per_thread = (M + config.physical_cores_per_socket - 1) / config.physical_cores_per_socket;
-                size_t m_start = local_tid * rows_per_thread;
-                size_t m_end = std::min(M, m_start + rows_per_thread);
-
-                for (size_t i = m_start; i < m_end; i++) {
-                    float sum_sq = kernel::deepseek_rmsnorm_compute_sum_sq_row_i32(&input.view(socket)[i, 0], N_local);
-                    local_sum_sq.view()[socket, i] = sum_sq;
-                }
-            });
-        }
-    }
-    threads.clear();
-
-    // Phase 2: All-reduce sum(x^2) across sockets
-    for (size_t i = 0; i < M; i++) {
-        float total_sum_sq = 0.0f;
-        for (int socket = 0; socket < num_sockets; socket++) {
-            total_sum_sq += local_sum_sq.view()[socket, i];
-        }
-        global_sum_sq.view()[i] = total_sum_sq;
-    }
-
-    // Phase 3: Apply normalization with global variance
-    threads.reserve(num_sockets * config.physical_cores_per_socket);
-    for (int socket = 0; socket < num_sockets; socket++) {
-        for (int local_tid = 0; local_tid < config.physical_cores_per_socket; local_tid++) {
-            threads.emplace_back([&, socket, local_tid] {
-                pin_to_socket(socket, local_tid);
-
-                size_t rows_per_thread = (M + config.physical_cores_per_socket - 1) / config.physical_cores_per_socket;
-                size_t m_start = local_tid * rows_per_thread;
-                size_t m_end = std::min(M, m_start + rows_per_thread);
-
-                for (size_t i = m_start; i < m_end; i++) {
-                    float mean_sq = global_sum_sq.view()[i] / static_cast<float>(N_total);
-                    float rstd = 1.0f / std::sqrt(mean_sq + eps);
-                    kernel::deepseek_rmsnorm_apply_row_i32(
-                        &input.view(socket)[i, 0],
-                        &weight.view(socket)[0, 0],
-                        &output.view(socket)[i, 0],
-                        N_local,
-                        rstd
-                    );
-                }
-            });
-        }
-    }
-    threads.clear();
-}
-
-}
+} // namespace numa

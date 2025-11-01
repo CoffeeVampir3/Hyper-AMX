@@ -6,7 +6,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 file(GLOB_RECURSE MODULE_FILES "${CMAKE_SOURCE_DIR}/modules/*.cppm")
 file(GLOB_RECURSE TEST_FILES "${CMAKE_SOURCE_DIR}/tests/*.cppm")
-file(GLOB_RECURSE BENCHMARK_FILES "${CMAKE_SOURCE_DIR}/benchmarks/*.cppm")
 
 add_executable(amx_app)
 target_sources(amx_app PRIVATE main.cpp)
@@ -21,8 +20,11 @@ target_compile_options(amx_app PRIVATE
     -mamx-tile
     -mamx-int8
     -mamx-bf16
-    -march=native)
-target_link_options(amx_app PRIVATE -stdlib=libc++ -lc++abi)
+    -march=native
+    -fsanitize=address
+    -fno-omit-frame-pointer
+)
+target_link_options(amx_app PRIVATE -stdlib=libc++ -lc++abi -fsanitize=address)
 target_link_libraries(amx_app PRIVATE numa)
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release")

@@ -8,6 +8,7 @@ module;
 export module amx_gemms;
 import tensor;
 import layout;
+import avx512;
 
 namespace amx {
     constexpr size_t TILE_M = 16;

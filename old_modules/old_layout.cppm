@@ -1,26 +1,14 @@
 module;
-#include <array>
-#include <concepts>
 #include <cstddef>
+#include <cstring>
+#include <concepts>
 #include <mdspan>
+export module layout;
+import avx512;
 
-export module hyperamx.layout;
-
-import hyperamx.avx512;
+using namespace avx512;
 
 export namespace Layout {
-
-constexpr size_t STREAM_THRESHOLD_BYTES = 256 * 1024;
-
-template<typename T, typename SrcView>
-constexpr avx512::StoreHint select_hint(const SrcView& src, int dim, size_t offset, size_t size) {
-    size_t rows = src.extent(0);
-    size_t cols = src.extent(1);
-    size_t bytes = (dim == 0)
-        ? std::min(size, rows - offset) * cols * sizeof(T)
-        : rows * std::min(size, cols - offset) * sizeof(T);
-    return bytes >= STREAM_THRESHOLD_BYTES ? avx512::StoreHint::NonTemporal : avx512::StoreHint::Temporal;
-}
 
 template<typename L, typename SrcView, typename DstView>
 concept TensorLayout = requires(SrcView src, DstView dst, int dim, size_t offset, size_t size) {
@@ -32,24 +20,16 @@ struct RowMajor {
     template<typename Extents>
     using mapping = typename std::layout_right::template mapping<Extents>;
 
-    template<typename Extents>
-    static constexpr auto default_strides(const Extents& extents) {
-        constexpr size_t rank = Extents::rank();
-        static_assert(rank == 2);
-        std::array<size_t, rank> strides{};
-        strides[0] = extents.extent(1);
-        strides[1] = 1;
-        return strides;
-    }
-
     template<typename SrcView, typename DstView>
     static void copy_from(const SrcView& src, DstView& dst, int dim, size_t offset, size_t size) {
-        avx512::StoreHint hint = select_hint<typename DstView::element_type>(src, dim, offset, size);
-        if (hint == avx512::StoreHint::NonTemporal) {
-            avx512::copy_row_major<avx512::StoreHint::NonTemporal>(src, dst, dim, offset, size);
-            avx512::stream_fence();
+        using T = typename DstView::element_type;
+
+        if (dim == 0) {
+            contiguous_copy(dst.data_handle(),
+                                   src.data_handle() + offset * src.extent(1),
+                                   size * src.extent(1));
         } else {
-            avx512::copy_row_major<avx512::StoreHint::Temporal>(src, dst, dim, offset, size);
+            element_wise_copy_2d(src, dst, 0, offset, src.extent(0), size);
         }
     }
 };
@@ -58,24 +38,16 @@ struct ColumnMajor {
     template<typename Extents>
     using mapping = typename std::layout_left::template mapping<Extents>;
 
-    template<typename Extents>
-    static constexpr auto default_strides(const Extents& extents) {
-        constexpr size_t rank = Extents::rank();
-        static_assert(rank == 2);
-        std::array<size_t, rank> strides{};
-        strides[0] = 1;
-        strides[1] = extents.extent(0);
-        return strides;
-    }
-
     template<typename SrcView, typename DstView>
     static void copy_from(const SrcView& src, DstView& dst, int dim, size_t offset, size_t size) {
-        avx512::StoreHint hint = select_hint<typename DstView::element_type>(src, dim, offset, size);
-        if (hint == avx512::StoreHint::NonTemporal) {
-            avx512::copy_column_major<avx512::StoreHint::NonTemporal>(src, dst, dim, offset, size);
-            avx512::stream_fence();
+        using T = typename DstView::element_type;
+
+        if (dim == 1) {
+            contiguous_copy(dst.data_handle(),
+                                   src.data_handle() + offset * src.extent(0),
+                                   size * src.extent(0));
         } else {
-            avx512::copy_column_major<avx512::StoreHint::Temporal>(src, dst, dim, offset, size);
+            element_wise_copy_2d(src, dst, offset, 0, size, src.extent(1));
         }
     }
 };
@@ -89,6 +61,8 @@ struct VNNI {
         using is_vnni_layout = std::true_type;
 
         Extents extents_;
+
+        static constexpr size_t TILE_N_BYTES = TILE_N * VNNI_BLK;
 
         constexpr mapping(Extents e) : extents_(e) {}
         constexpr const Extents& extents() const { return extents_; }
@@ -128,14 +102,12 @@ struct VNNI {
 
     template<typename SrcView, typename DstView>
     static void copy_from(const SrcView& src, DstView& dst, int dim, size_t offset, size_t size) {
-        avx512::StoreHint hint = select_hint<typename DstView::element_type>(src, dim, offset, size);
-        if (hint == avx512::StoreHint::NonTemporal) {
-            avx512::copy_vnni<avx512::StoreHint::NonTemporal>(src, dst, dim, offset, size);
-            avx512::stream_fence();
+        if (dim == 0) {
+            element_wise_copy_2d(src, dst, offset, 0, size, src.extent(1));
         } else {
-            avx512::copy_vnni<avx512::StoreHint::Temporal>(src, dst, dim, offset, size);
+            element_wise_copy_2d(src, dst, 0, offset, src.extent(0), size);
         }
     }
 };
 
-} // namespace Layout
+}
