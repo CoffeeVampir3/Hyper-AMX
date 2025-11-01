@@ -28,7 +28,7 @@ export void run_numa_matmul_bench() {
         return;
     }
     auto config = DualSocketConfig::discover();
-    std::println("Configuration:");
+    std::println("matmul_amx_column_parallel: Configuration:");
     std::println("  Matrix dimensions: {}x{}x{}", M, K, N);
     std::println("  Iterations: {}", NUM_ITERS);
     std::println("  NUMA nodes: {}", DualSocketConfig::NUM_NODES);

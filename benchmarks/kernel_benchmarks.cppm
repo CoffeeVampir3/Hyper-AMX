@@ -21,7 +21,7 @@ using Extents2D = std::dextents<size_t, 2>;
 
 export void run_kernel_benchmarks() {
     auto config = DualSocketConfig::discover();
-    std::println("Configuration:");
+    std::println("silu_mul_requantize_parallel: Configuration:");
     std::println("  Matrix dimensions: {}x{}", M, N);
     std::println("  Iterations: {}", NUM_ITERS);
     std::println("  NUMA nodes: {}", DualSocketConfig::NUM_NODES);

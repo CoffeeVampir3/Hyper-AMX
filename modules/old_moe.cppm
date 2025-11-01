@@ -16,6 +16,10 @@ import avx512;
 
 export namespace MoE {
 
+inline float sigmoid(float x) {
+    return 1.0f / (1.0f + std::exp(-x));
+}
+
 using Extents2D = std::dextents<size_t, 2>;
 using VNNILayout = Layout::VNNI<16, 64, 16, 64, 4>;
 
@@ -82,8 +86,7 @@ void group_based_routing(
 
     for (size_t e = 0; e < n_experts; e++) {
         float logit = logits_view[0, e];
-        float prob = 1.0f / (1.0f + std::exp(-logit));
-        corrected_view[0, e] = prob + bias_view[0, e];
+        corrected_view[0, e] = sigmoid(logit) + bias_view[0, e];
     }
 
     std::vector<float> group_scores(n_group);
@@ -95,7 +98,6 @@ void group_based_routing(
     std::vector<float> final_values(top_k);
 
     for (int g = 0; g < n_group; g++) {
-        float top2_sum = 0.0f;
         float max1 = -INFINITY, max2 = -INFINITY;
         for (size_t e = 0; e < experts_per_group; e++) {
             float val = corrected_view[0, g * experts_per_group + e];
@@ -127,7 +129,7 @@ void group_based_routing(
 
     float sum_weights = 0.0f;
     for (int k = 0; k < top_k; k++) {
-        float original_prob = 1.0f / (1.0f + std::exp(-logits_view[0, final_indices[k]]));
+        float original_prob = sigmoid(logits_view[0, final_indices[k]]);
         final_values[k] = original_prob;
         sum_weights += original_prob;
     }
@@ -155,10 +157,10 @@ void compute_swiglu_mlp_batch(
     Tensor2D<int32_t> up_out(Extents2D{n_tokens, intermediate_size});
     Tensor2D<int8_t> intermediate(Extents2D{n_tokens, intermediate_size});
 
-    cpugemm::i8_i8_i32_vector_by_matrix_blocked(hidden.view(), gate_weight.view(socket), gate_out.view(), 0, 1);
-    cpugemm::i8_i8_i32_vector_by_matrix_blocked(hidden.view(), up_weight.view(socket), up_out.view(), 0, 1);
+    cpugemm::i8_i8_i32_blocked(hidden.view(), gate_weight.view(socket), gate_out.view(), 0, 1);
+    cpugemm::i8_i8_i32_blocked(hidden.view(), up_weight.view(socket), up_out.view(), 0, 1);
     kernel::silu_mul_requantize(gate_out.view(), up_out.view(), intermediate.view(), 0, 1);
-    cpugemm::i8_i8_i32_vector_by_matrix_blocked(intermediate.view(), down_weight.view(socket), output.view(), 0, 1);
+    cpugemm::i8_i8_i32_blocked(intermediate.view(), down_weight.view(socket), output.view(), 0, 1);
 }
 
 template<typename T>

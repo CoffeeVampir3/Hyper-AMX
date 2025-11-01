@@ -14,7 +14,6 @@ module;
 #include <algorithm>
 #include <bit>
 export module avx512;
-import tensor;
 
 // The reason this is a singular file is because immintrin.h is absolute cancer so we need a containment module for it.
 
@@ -394,6 +393,19 @@ inline bool request_amx() {
 }
 
 template<typename T>
+inline auto make_broadcast_vec(T value) {
+    if constexpr (std::same_as<T, int8_t>) {
+        return _mm512_set1_epi8(value);
+    } else if constexpr (std::same_as<T, uint8_t>) {
+        return _mm512_set1_epi8(value);
+    } else if constexpr (std::same_as<T, int32_t>) {
+        return _mm512_set1_epi32(value);
+    } else if constexpr (std::same_as<T, _Float16>) {
+        return _mm512_set1_ph(value);
+    }
+}
+
+template<typename T>
 void contiguous_copy(T* dst, const T* src, size_t element_count) {
     std::memcpy(dst, src, element_count * sizeof(T));
 }
@@ -476,6 +488,13 @@ void element_wise_copy_2d(const SrcView& src, DstView& dst,
     }
 }
 
+template<typename T>
+concept TensorStorage = requires(T t, int dim) {
+    typename T::extents_type;
+    { t.extent(dim) } -> std::same_as<size_t>;
+    { t.view() };
+};
+
 template<TensorStorage T, typename Fn>
 void fill(T& tensor, Fn&& fn) {
     auto view = tensor.view();
@@ -494,7 +513,7 @@ void fill_constant_avx512(auto view) {
     constexpr size_t elems_per_vec = 64 / sizeof(elem_t);
     size_t rows = view.extent(0);
     size_t cols = view.extent(1);
-    auto make_vec = []() {
+    auto vec = [&]() {
         if constexpr (Value == 0) {
             if constexpr (std::same_as<elem_t, _Float16>) {
                 return _mm512_setzero_ph();
@@ -502,16 +521,9 @@ void fill_constant_avx512(auto view) {
                 return _mm512_setzero_si512();
             }
         } else {
-            if constexpr (std::same_as<elem_t, int8_t> || std::same_as<elem_t, uint8_t>) {
-                return _mm512_set1_epi8(Value);
-            } else if constexpr (std::same_as<elem_t, int32_t>) {
-                return _mm512_set1_epi32(Value);
-            } else if constexpr (std::same_as<elem_t, _Float16>) {
-                return _mm512_set1_ph(Value);
-            }
+            return make_broadcast_vec(static_cast<elem_t>(Value));
         }
-    };
-    auto vec = make_vec();
+    }();
     for (size_t i = 0; i < rows; i++) {
         elem_t* row_ptr = &view[i, 0];
         size_t j = 0;
@@ -533,15 +545,9 @@ template<TensorStorage T>
 void zero(T& tensor) {
     auto view = tensor.view();
     if constexpr (requires { view.extent(0); view.extent(1); }) {
-        using elem_t = typename decltype(view)::element_type;
-        if constexpr (std::same_as<elem_t, int8_t> || std::same_as<elem_t, uint8_t> ||
-                      std::same_as<elem_t, int32_t> || std::same_as<elem_t, _Float16>) {
-            fill_constant_avx512<elem_t{0}>(view);
-        } else {
-            fill(tensor, [](auto...) { return 0; });
-        }
+        std::memset(view.data_handle(), 0, view.size() * sizeof(typename decltype(view)::element_type));
     } else {
-        fill(tensor, [](auto...) { return 0; });
+        fill(tensor, [](auto...) { return typename decltype(view)::element_type{0}; });
     }
 }
 
@@ -554,10 +560,10 @@ void ones(T& tensor) {
                       std::same_as<elem_t, int32_t> || std::same_as<elem_t, _Float16>) {
             fill_constant_avx512<elem_t{1}>(view);
         } else {
-            fill(tensor, [](auto...) { return 1; });
+            fill(tensor, [](auto...) { return elem_t{1}; });
         }
     } else {
-        fill(tensor, [](auto...) { return 1; });
+        fill(tensor, [](auto...) { return typename decltype(view)::element_type{1}; });
     }
 }
 
@@ -584,6 +590,59 @@ inline void reference_matmul(const auto& A, const auto& B, auto C) {
             }
             C[i, j] = sum;
         }
+    }
+}
+
+template<typename T>
+void fill_padding_rows(T* dst, size_t num_rows, size_t cols, T fill_value) {
+    constexpr size_t elems_per_vec = 64 / sizeof(T);
+    auto fill_vec = make_broadcast_vec(fill_value);
+
+    for (size_t i = 0; i < num_rows; i++) {
+        T* row_ptr = dst + i * cols;
+        size_t j = 0;
+        for (; j + elems_per_vec <= cols; j += elems_per_vec) {
+            if constexpr (std::same_as<T, _Float16>) {
+                _mm512_stream_si512((__m512i*)(row_ptr + j), _mm512_castph_si512(fill_vec));
+            } else {
+                _mm512_stream_si512((__m512i*)(row_ptr + j), fill_vec);
+            }
+        }
+        for (; j < cols; j++) {
+            row_ptr[j] = fill_value;
+        }
+    }
+    _mm_sfence();
+}
+
+template<typename T>
+void fill_padding_cols(T* dst, size_t stride, size_t num_rows, size_t start_col, size_t num_cols, T fill_value) {
+    constexpr size_t elems_per_vec = 64 / sizeof(T);
+    auto fill_vec = make_broadcast_vec(fill_value);
+
+    for (size_t i = 0; i < num_rows; i++) {
+        T* row_ptr = dst + i * stride + start_col;
+        size_t j = 0;
+        for (; j + elems_per_vec <= num_cols; j += elems_per_vec) {
+            if constexpr (std::same_as<T, _Float16>) {
+                _mm512_stream_si512((__m512i*)(row_ptr + j), _mm512_castph_si512(fill_vec));
+            } else {
+                _mm512_stream_si512((__m512i*)(row_ptr + j), fill_vec);
+            }
+        }
+        for (; j < num_cols; j++) {
+            row_ptr[j] = fill_value;
+        }
+    }
+    _mm_sfence();
+}
+
+template<typename T>
+void gather_rows_impl(const T* src, size_t src_stride, T* dst, size_t dst_stride,
+                     const size_t* row_indices, size_t num_rows) {
+    for (size_t i = 0; i < num_rows; i++) {
+        size_t src_row = row_indices[i];
+        std::memcpy(dst + i * dst_stride, src + src_row * src_stride, dst_stride * sizeof(T));
     }
 }
 

@@ -163,6 +163,11 @@ struct Partitioned {
     Partitioned(const Source& source, int n_parts, const DualSocketConfig& config)
         : num_partitions(n_parts) {
         size_t dim_size = source.extent(partition_dim);
+        if (dim_size % n_parts != 0) {
+            throw std::runtime_error(std::format(
+                "Partitioned: dimension {} (size={}) must be evenly divisible by num_partitions={}",
+                partition_dim, dim_size, n_parts));
+        }
         size_t part_size = dim_size / n_parts;
 
         auto src_extents = source.view().extents();

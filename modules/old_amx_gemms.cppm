@@ -44,9 +44,33 @@ concept Int32RowMajor = requires(View v) {
     requires std::same_as<typename View::layout_type, Layout::RowMajor>;
 };
 
+namespace detail {
 template<typename View>
-size_t stride_bytes(const View& v) {
-    return v.extent(1) * sizeof(typename View::element_type);
+constexpr size_t stride_bytes(const View& v) {
+    return v.stride(0) * sizeof(typename View::element_type);
+}
+
+struct Range { size_t start, end; };
+
+constexpr Range partition_range(size_t total, int thread_id, int num_threads) {
+    size_t per_thread = (total + num_threads - 1) / num_threads;
+    size_t start = thread_id * per_thread;
+    return {start, std::min(total, start + per_thread)};
+}
+
+constexpr TileConfig make_i8_gemm_config() {
+    TileConfig cfg{};
+    cfg.palette_id = 1;
+    cfg.rows[0] = cfg.rows[1] = amx::TILE_M;
+    cfg.colsb[0] = cfg.colsb[1] = amx::TILE_K;
+    cfg.rows[2] = cfg.rows[3] = amx::TILE_K / 4;
+    cfg.colsb[2] = cfg.colsb[3] = amx::TILE_N * 4;
+    for (int i = 4; i < 8; i++) {
+        cfg.rows[i] = amx::TILE_M;
+        cfg.colsb[i] = amx::TILE_N * 4;
+    }
+    return cfg;
+}
 }
 
 export namespace cpugemm {
@@ -61,31 +85,12 @@ void i8_i8_i32_blocked(Int8RowMajor auto A, Int8VNNI auto B, Int32RowMajor auto 
     size_t M = A.extent(0);
     size_t K = A.extent(1);
     size_t N = C.extent(1);
-    size_t n_per_thread = (N + num_threads - 1) / num_threads;
-    size_t n_start = thread_id * n_per_thread;
-    size_t n_end = std::min(N, n_start + n_per_thread);
+    auto [n_start, n_end] = detail::partition_range(N, thread_id, num_threads);
 
-    auto A_stride = stride_bytes(A);
-    auto C_stride = stride_bytes(C);
+    auto A_stride = detail::stride_bytes(A);
+    auto C_stride = detail::stride_bytes(C);
 
-    TileConfig cfg{};
-    cfg.palette_id = 1;
-    cfg.rows[0] = TILE_M;
-    cfg.colsb[0] = TILE_K;
-    cfg.rows[1] = TILE_M;
-    cfg.colsb[1] = TILE_K;
-    cfg.rows[2] = TILE_K / 4;
-    cfg.colsb[2] = TILE_N * 4;
-    cfg.rows[3] = TILE_K / 4;
-    cfg.colsb[3] = TILE_N * 4;
-    cfg.rows[4] = TILE_M;
-    cfg.colsb[4] = TILE_N * 4;
-    cfg.rows[5] = TILE_M;
-    cfg.colsb[5] = TILE_N * 4;
-    cfg.rows[6] = TILE_M;
-    cfg.colsb[6] = TILE_N * 4;
-    cfg.rows[7] = TILE_M;
-    cfg.colsb[7] = TILE_N * 4;
+    TileConfig cfg = detail::make_i8_gemm_config();
     _tile_loadconfig(&cfg);
 
     for (size_t kb = 0; kb < K; kb += K_BLOCK) {

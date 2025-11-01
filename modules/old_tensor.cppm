@@ -8,7 +8,15 @@ module;
 #include <functional>
 #include <type_traits>
 #include <utility>
+#include <stdexcept>
+#include <format>
 export module tensor;
+import avx512;
+
+using std::mdspan;
+using dextents2d = std::dextents<size_t, 2>;
+using layout_right = std::layout_right;
+using layout_left = std::layout_left;
 
 export template<typename T>
 concept TensorStorage = requires(T t, int dim) {
@@ -25,10 +33,39 @@ concept VNNILayout = requires {
 template<typename Layout>
 concept SliceableLayout = !VNNILayout<Layout>;
 
+template<typename Layout>
+concept ContiguousRowMajorLayout = requires {
+    typename Layout::template mapping<std::dextents<size_t, 2>>;
+} && std::same_as<
+    typename Layout::template mapping<std::dextents<size_t, 2>>,
+    typename std::layout_right::template mapping<std::dextents<size_t, 2>>
+>;
+
+export constexpr size_t align_up(size_t value, size_t alignment) {
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
+export constexpr bool is_aligned(size_t value, size_t alignment) {
+    return (value % alignment) == 0;
+}
+
 namespace detail {
 
 template<typename T, typename Extents, typename Layout>
 using Mdspan = std::mdspan<T, Extents, Layout>;
+
+constexpr void validate_tile_alignment(size_t row_start, size_t row_count, size_t tile_m) {
+    if (row_start % tile_m != 0) {
+        throw std::invalid_argument(std::format(
+            "QuantizedTensor row slice start {} must be aligned to TILE_M={}",
+            row_start, tile_m));
+    }
+    if (row_count % tile_m != 0) {
+        throw std::invalid_argument(std::format(
+            "QuantizedTensor row slice count {} must be multiple of TILE_M={}",
+            row_count, tile_m));
+    }
+}
 
 template<typename Derived, typename Layout>
 struct TensorCopyOps {
@@ -45,7 +82,9 @@ struct TensorCopyOps {
 
     template<TensorStorage Dest>
     void copy_slice_to(Dest& dest, int dim, size_t offset, size_t size) const {
-        Layout::copy_from(self().view(), dest.view(), dim, offset, size);
+        auto src = self().view();
+        auto dst = dest.view();
+        Layout::copy_from(src, dst, dim, offset, size);
     }
 };
 
@@ -75,13 +114,24 @@ struct QuantizedCopyOps {
 
     template<typename Dest>
     void copy_slice_to(Dest& dest, int dim, size_t offset, size_t size) const requires requires(Dest& d) { d.view(); d.scales_view(); } {
+        auto scale = scale_for_dim(dim);
+        if (offset % scale != 0) {
+            throw std::invalid_argument(std::format(
+                "QuantizedTensor slice offset {} must be aligned to tile boundary {}",
+                offset, scale));
+        }
+        if (size % scale != 0) {
+            throw std::invalid_argument(std::format(
+                "QuantizedTensor slice size {} must be multiple of tile size {}",
+                size, scale));
+        }
+
         auto src_data = self().view();
         auto dst_data = dest.view();
         Layout::copy_from(src_data, dst_data, dim, offset, size);
 
         auto src_scales = self().scales_view();
         auto dst_scales = dest.scales_view();
-        auto scale = scale_for_dim(dim);
         Layout::copy_from(src_scales, dst_scales, dim, offset / scale, size / scale);
     }
 };
@@ -150,12 +200,10 @@ concept Allocator = requires(A a, size_t n) {
 export template<typename T>
 struct DefaultAllocator {
     T* allocate(size_t count) const {
-        size_t byte_size = count * sizeof(T);
-        size_t aligned_size = (byte_size + 63) & ~size_t(63);
-        return static_cast<T*>(std::aligned_alloc(64, aligned_size));
+        return static_cast<T*>(::operator new[](count * sizeof(T), std::align_val_t{64}));
     }
-    void deallocate(T* ptr, size_t) const {
-        std::free(ptr);
+    void deallocate(T* ptr, size_t count) const {
+        ::operator delete[](ptr, count * sizeof(T), std::align_val_t{64});
     }
 };
 
@@ -205,22 +253,15 @@ struct Tensor : detail::TensorCopyOps<Tensor<T, Extents, Layout>, Layout> {
     auto view() { return mdspan_type{data.get(), map}; }
     auto view() const { return const_mdspan_type{data.get(), map}; }
 
-    auto subview(size_t row_start, size_t row_count) {
+    template<typename Self>
+    auto subview(this Self&& self, size_t row_start, size_t row_count) {
         static_assert(SliceableLayout<Layout>, "Cannot slice VNNI layout tensors");
-        auto v = view();
-        T* slice_ptr = v.data_handle() + row_start * v.extent(1);
+        auto v = self.view();
+        using elem_type = std::remove_reference_t<decltype(*v.data_handle())>;
+        elem_type* slice_ptr = v.data_handle() + row_start * v.extent(1);
         using slice_extents = std::dextents<size_t, 2>;
-        auto sliced = std::mdspan<T, slice_extents, Layout>(slice_ptr, row_count, v.extent(1));
-        return TensorView<T, slice_extents, Layout>(sliced);
-    }
-
-    auto subview(size_t row_start, size_t row_count) const {
-        static_assert(SliceableLayout<Layout>, "Cannot slice VNNI layout tensors");
-        auto v = view();
-        const T* slice_ptr = v.data_handle() + row_start * v.extent(1);
-        using slice_extents = std::dextents<size_t, 2>;
-        auto sliced = std::mdspan<const T, slice_extents, Layout>(slice_ptr, row_count, v.extent(1));
-        return TensorView<const T, slice_extents, Layout>(sliced);
+        auto sliced = std::mdspan<elem_type, slice_extents, Layout>(slice_ptr, row_count, v.extent(1));
+        return TensorView<elem_type, slice_extents, Layout>(sliced);
     }
 
 };
@@ -265,23 +306,129 @@ struct QuantizedTensor : detail::QuantizedCopyOps<QuantizedTensor<T, DataExtents
     auto scales_view() { return group_quant_scales.view(); }
     auto scales_view() const { return group_quant_scales.view(); }
 
-    auto subview(size_t row_start, size_t row_count) {
+    template<typename Self>
+    auto subview(this Self&& self, size_t row_start, size_t row_count) {
         static_assert(SliceableLayout<DataLayout>, "Cannot slice VNNI layout tensors");
-        auto data_slice = data.subview(row_start, row_count);
-        auto scales_slice = group_quant_scales.subview(row_start / TILE_M, row_count / TILE_M);
+        detail::validate_tile_alignment(row_start, row_count, TILE_M);
+        auto data_slice = self.data.subview(row_start, row_count);
+        auto scales_slice = self.group_quant_scales.subview(row_start / TILE_M, row_count / TILE_M);
         using data_slice_extents = typename decltype(data_slice)::extents_type;
         using scales_slice_extents = typename decltype(scales_slice)::extents_type;
-        return QuantizedTensorView<T, data_slice_extents, DataLayout, scales_slice_extents, QuantScaleType, TILE_M, TILE_N>(
-            data_slice.view(), scales_slice.view());
-    }
-
-    auto subview(size_t row_start, size_t row_count) const {
-        static_assert(SliceableLayout<DataLayout>, "Cannot slice VNNI layout tensors");
-        auto data_slice = data.subview(row_start, row_count);
-        auto scales_slice = group_quant_scales.subview(row_start / TILE_M, row_count / TILE_M);
-        using data_slice_extents = typename decltype(data_slice)::extents_type;
-        using scales_slice_extents = typename decltype(scales_slice)::extents_type;
-        return QuantizedTensorView<const T, data_slice_extents, DataLayout, scales_slice_extents, const QuantScaleType, TILE_M, TILE_N>(
+        using data_elem_type = std::remove_reference_t<decltype(*data_slice.view().data_handle())>;
+        using scales_elem_type = std::remove_reference_t<decltype(*scales_slice.view().data_handle())>;
+        return QuantizedTensorView<data_elem_type, data_slice_extents, DataLayout, scales_slice_extents, scales_elem_type, TILE_M, TILE_N>(
             data_slice.view(), scales_slice.view());
     }
 };
+
+export namespace tensor_ops {
+
+namespace detail {
+template<typename T, typename Extents, typename Layout>
+void pad_implementation(const Tensor<T, Extents, Layout>& source,
+                       Tensor<T, Extents, Layout>& padded,
+                       size_t orig_M, size_t orig_N,
+                       size_t padded_M, size_t padded_N,
+                       T fill_value)
+{
+    auto src_view = source.view();
+    auto dst_view = padded.view();
+
+    for (size_t i = 0; i < orig_M; i++) {
+        avx512::contiguous_copy(&dst_view[i, 0], &src_view[i, 0], orig_N);
+    }
+
+    if constexpr (std::same_as<T, int8_t> || std::same_as<T, int32_t> || std::same_as<T, _Float16>) {
+        if (padded_N > orig_N) {
+            avx512::fill_padding_cols(&dst_view[0, 0], padded_N, orig_M, orig_N, padded_N - orig_N, fill_value);
+        }
+        if (padded_M > orig_M) {
+            avx512::fill_padding_rows(&dst_view[orig_M, 0], padded_M - orig_M, padded_N, fill_value);
+        }
+    } else {
+        for (size_t i = 0; i < orig_M; i++) {
+            for (size_t j = orig_N; j < padded_N; j++) {
+                dst_view[i, j] = fill_value;
+            }
+        }
+        for (size_t i = orig_M; i < padded_M; i++) {
+            for (size_t j = 0; j < padded_N; j++) {
+                dst_view[i, j] = fill_value;
+            }
+        }
+    }
+}
+}
+
+template<typename T, typename Extents, typename Layout>
+Tensor<T, Extents, Layout> pad_to_alignment(
+    const Tensor<T, Extents, Layout>& source,
+    size_t row_alignment,
+    size_t col_alignment,
+    T fill_value = T{0})
+{
+    static_assert(Extents::rank() == 2, "pad_to_alignment only supports 2D tensors");
+    static_assert(SliceableLayout<Layout>, "Cannot pad VNNI layout tensors directly");
+    static_assert(ContiguousRowMajorLayout<Layout>, "pad_to_alignment requires contiguous row-major layout");
+
+    size_t orig_M = source.extent(0);
+    size_t orig_N = source.extent(1);
+    size_t padded_M = align_up(orig_M, row_alignment);
+    size_t padded_N = align_up(orig_N, col_alignment);
+
+    auto padded = Tensor<T, Extents, Layout>(Extents{padded_M, padded_N});
+    detail::pad_implementation(source, padded, orig_M, orig_N, padded_M, padded_N, fill_value);
+    return padded;
+}
+
+template<typename T, typename Extents, typename Layout, typename Alloc>
+Tensor<T, Extents, Layout> pad_to_alignment(
+    const Tensor<T, Extents, Layout>& source,
+    size_t row_alignment,
+    size_t col_alignment,
+    Alloc allocator,
+    T fill_value = T{0})
+{
+    static_assert(Extents::rank() == 2, "pad_to_alignment only supports 2D tensors");
+    static_assert(SliceableLayout<Layout>, "Cannot pad VNNI layout tensors directly");
+    static_assert(ContiguousRowMajorLayout<Layout>, "pad_to_alignment requires contiguous row-major layout");
+
+    size_t orig_M = source.extent(0);
+    size_t orig_N = source.extent(1);
+    size_t padded_M = align_up(orig_M, row_alignment);
+    size_t padded_N = align_up(orig_N, col_alignment);
+
+    auto padded = Tensor<T, Extents, Layout>(Extents{padded_M, padded_N}, allocator);
+    detail::pad_implementation(source, padded, orig_M, orig_N, padded_M, padded_N, fill_value);
+    return padded;
+}
+
+template<typename T, typename Extents, typename Layout>
+Tensor<T, Extents, Layout> gather_rows(
+    const Tensor<T, Extents, Layout>& source,
+    const size_t* row_indices,
+    size_t num_rows)
+{
+    static_assert(Extents::rank() == 2, "gather_rows only supports 2D tensors");
+    static_assert(ContiguousRowMajorLayout<Layout>, "gather_rows requires contiguous row-major layout");
+
+    size_t N = source.extent(1);
+    auto gathered = Tensor<T, Extents, Layout>(Extents{num_rows, N});
+
+    auto src_view = source.view();
+    auto dst_view = gathered.view();
+
+    avx512::gather_rows_impl(&src_view[0, 0], N, &dst_view[0, 0], N, row_indices, num_rows);
+
+    return gathered;
+}
+
+template<typename T, typename Extents, typename Layout, typename IndexContainer>
+Tensor<T, Extents, Layout> gather_rows(
+    const Tensor<T, Extents, Layout>& source,
+    const IndexContainer& row_indices)
+{
+    return gather_rows(source, row_indices.data(), row_indices.size());
+}
+
+}

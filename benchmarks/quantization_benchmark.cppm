@@ -20,6 +20,7 @@ inline void clobber_memory() {
 }
 
 export void run_quantization_benchmark() {
+    std::println("Quantization Benchmark:");
     constexpr int NUM_RUNS = 10000;
     constexpr int TILE_SIZE_BYTES = 16 * 16 * sizeof(int32_t);
     constexpr int TILE_SIZE_INT8 = 16 * 16;
@@ -135,8 +136,8 @@ export void run_quantization_benchmark() {
     std::println("  Total roundtrip:   {:.0f} ns/tile", quant_ns_per_tile + dequant_ns_per_tile);
     std::println("  Compression:       4× (1024B → 256B + 6B params)");
 
-    delete[] input_tiles;
-    delete[] output_tiles;
-    delete[] recon_tiles;
+    ::operator delete[](input_tiles, NUM_RUNS * 16 * 16 * sizeof(int32_t), std::align_val_t{64});
+    ::operator delete[](output_tiles, NUM_RUNS * 16 * 16 * sizeof(int8_t), std::align_val_t{64});
+    ::operator delete[](recon_tiles, NUM_RUNS * 16 * 16 * sizeof(int32_t), std::align_val_t{64});
     delete[] params;
 }

@@ -6,6 +6,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 file(GLOB_RECURSE MODULE_FILES "${CMAKE_SOURCE_DIR}/modules/*.cppm")
 file(GLOB_RECURSE TEST_FILES "${CMAKE_SOURCE_DIR}/tests/*.cppm")
+file(GLOB_RECURSE BENCHMARK_FILES "${CMAKE_SOURCE_DIR}/benchmarks/*.cppm")
 
 add_executable(amx_app)
 target_sources(amx_app PRIVATE main.cpp)
